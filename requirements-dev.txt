@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Used by test/local_server.py
+Flask==3.1.2

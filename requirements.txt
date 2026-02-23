@@ -1,0 +1,4 @@
+# Runtime dependencies for src/
+# Extracted from conda env: myPyHaptics (Python 3.12.12)
+paho-mqtt==2.1.0
+bhaptics-python==0.2.0

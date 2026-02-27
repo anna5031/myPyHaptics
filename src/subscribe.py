@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import asyncio
@@ -49,9 +49,13 @@ STALE_START_THRESHOLD_MS = 5000
 
 DEFAULT_CONFIG_DB_NAME = "config.db"
 DEFAULT_CONFIG_DIRNAME = "myPyHaptics"
+DEFAULT_VIBRATION_INTENSITY = 20
+VIBRATION_INTENSITY_MIN = 0
+VIBRATION_INTENSITY_MAX = 100
+VIBRATION_INTENSITY_STEP = 5
 PHASE_SHIFT_MIN_MS = -2000
 PHASE_SHIFT_MAX_MS = 2000
-PHASE_SHIFT_STEP_MS = 10
+PHASE_SHIFT_STEP_MS = 5
 
 
 def _default_config_db_path() -> Path:
@@ -126,6 +130,38 @@ class ConfigStore:
                         updated_at = excluded.updated_at
                     """,
                     ("phase_shift_ms", str(value), _utc_now_iso()),
+                )
+                conn.commit()
+
+    def load_vibration_intensity(self, default: int = DEFAULT_VIBRATION_INTENSITY) -> int:
+        with self._lock:
+            self._initialize()
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "SELECT value FROM app_config WHERE key = ?",
+                    ("vibration_intensity",),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return default
+                try:
+                    return int(row[0])
+                except (TypeError, ValueError):
+                    return default
+
+    def save_vibration_intensity(self, value: int) -> None:
+        with self._lock:
+            self._initialize()
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO app_config(key, value, updated_at)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    ("vibration_intensity", str(value), _utc_now_iso()),
                 )
                 conn.commit()
 
@@ -246,6 +282,12 @@ class HapticsController:
         self.current_bpm = DEFAULT_BPM
         self.current_run = 0
         self.current_run_state = "stopped"
+        loaded_intensity = self.config_store.load_vibration_intensity(
+            default=DEFAULT_VIBRATION_INTENSITY
+        )
+        self.vibration_intensity = self._clamp_vibration_intensity(loaded_intensity)
+        if loaded_intensity != self.vibration_intensity:
+            self.config_store.save_vibration_intensity(self.vibration_intensity)
         self.phase_shift_ms = self.config_store.load_phase_shift_ms(default=0)
         self.pending_phase_shift_ms = 0
         self.session_phase_shift_delta_ms = 0
@@ -264,6 +306,14 @@ class HapticsController:
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
+
+    @staticmethod
+    def _clamp_vibration_intensity(value: int) -> int:
+        if value < VIBRATION_INTENSITY_MIN:
+            return VIBRATION_INTENSITY_MIN
+        if value > VIBRATION_INTENSITY_MAX:
+            return VIBRATION_INTENSITY_MAX
+        return value
 
     def _set_run_state(self, state: str) -> None:
         with self._status_lock:
@@ -337,8 +387,10 @@ class HapticsController:
                 self._set_last_event(f"applied pending phase shift shift_ms={shift_ms}")
 
             bpm = self.current_bpm
+            with self._status_lock:
+                intensity = self.vibration_intensity
             beat_interval = 60.0 / bpm
-            values = [20] * MOTOR_LEN
+            values = [intensity] * MOTOR_LEN
             await bhaptics_python.play_dot(0, 100, values, -1)
             print("played haptic feedback")
 
@@ -428,6 +480,18 @@ class HapticsController:
         self.current_bpm = bpm
         self._set_last_event(f"updated bpm={bpm}")
         print(f"updated bpm={bpm}")
+
+    async def _set_vibration_intensity_async(self, intensity: int) -> None:
+        if intensity < VIBRATION_INTENSITY_MIN or intensity > VIBRATION_INTENSITY_MAX:
+            raise ValueError(
+                "vibration intensity must be in "
+                f"[{VIBRATION_INTENSITY_MIN}, {VIBRATION_INTENSITY_MAX}]"
+            )
+        with self._status_lock:
+            self.vibration_intensity = intensity
+        self.config_store.save_vibration_intensity(intensity)
+        self._set_last_event(f"updated vibration_intensity={intensity}")
+        print(f"updated vibration_intensity={intensity}")
 
     async def _set_phase_shift_async(self, phase_shift_ms: int) -> None:
         if phase_shift_ms < PHASE_SHIFT_MIN_MS or phase_shift_ms > PHASE_SHIFT_MAX_MS:
@@ -551,6 +615,13 @@ class HapticsController:
         future = asyncio.run_coroutine_threadsafe(self._set_bpm_async(bpm), self.loop)
         future.result(timeout=timeout)
 
+    def set_vibration_intensity(self, intensity: int, timeout: float = 5.0) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            self._set_vibration_intensity_async(intensity),
+            self.loop,
+        )
+        future.result(timeout=timeout)
+
     def set_phase_shift(self, phase_shift_ms: int, timeout: float = 5.0) -> None:
         future = asyncio.run_coroutine_threadsafe(
             self._set_phase_shift_async(phase_shift_ms),
@@ -575,6 +646,7 @@ class HapticsController:
             return {
                 "current_bpm": self.current_bpm,
                 "run_state": self.current_run_state,
+                "vibration_intensity": self.vibration_intensity,
                 "phase_shift_ms": self.phase_shift_ms,
                 "pending_phase_shift_ms": self.pending_phase_shift_ms,
                 "effective_phase_shift_ms": effective_phase_shift,
@@ -611,6 +683,10 @@ class SubscriberControlUI:
 
         self.bpm_var = tk.StringVar(value="-")
         self.run_state_var = tk.StringVar(value="-")
+        self.vibration_intensity_var = tk.StringVar(value="-")
+        self.vibration_intensity_entry_var = tk.StringVar(
+            value=str(DEFAULT_VIBRATION_INTENSITY)
+        )
         self.phase_shift_entry_var = tk.StringVar(value="0")
         self.applied_phase_shift_var = tk.StringVar(value="-")
         self.pending_phase_shift_var = tk.StringVar(value="-")
@@ -619,13 +695,15 @@ class SubscriberControlUI:
         self.offset_var = tk.StringVar(value="-")
         self.last_event_var = tk.StringVar(value="-")
         self.apply_status_var = tk.StringVar(value="")
+        self.vibration_intensity_entry_dirty = False
+        self.phase_entry_dirty = False
 
         self._build_layout()
         self._refresh()
 
     def _build_layout(self) -> None:
         self.root.title("myPyHaptics Subscriber")
-        self.root.geometry("640x340")
+        self.root.geometry("640x390")
         self.root.resizable(False, False)
 
         frame = tk.Frame(self.root, padx=12, pady=12)
@@ -637,9 +715,50 @@ class SubscriberControlUI:
         tk.Label(frame, text="Run State").grid(row=1, column=0, sticky="w")
         tk.Label(frame, textvariable=self.run_state_var).grid(row=1, column=1, sticky="w")
 
-        tk.Label(frame, text="Phase Shift (ms)").grid(row=2, column=0, sticky="w")
+        tk.Label(frame, text="Vibration Intensity").grid(row=2, column=0, sticky="w")
+        intensity_controls = tk.Frame(frame)
+        intensity_controls.grid(row=2, column=1, sticky="w")
+
+        tk.Button(
+            intensity_controls,
+            text="-",
+            width=3,
+            command=lambda: self._step_vibration_intensity(-VIBRATION_INTENSITY_STEP),
+        ).pack(side=tk.LEFT)
+        intensity_entry = tk.Entry(
+            intensity_controls,
+            textvariable=self.vibration_intensity_entry_var,
+            width=10,
+            justify="right",
+        )
+        self.vibration_intensity_entry = intensity_entry
+        intensity_entry.pack(side=tk.LEFT, padx=6)
+        intensity_entry.bind("<Return>", lambda _event: self._apply_vibration_intensity())
+        intensity_entry.bind(
+            "<KeyRelease>",
+            lambda _event: self._mark_vibration_intensity_entry_dirty(),
+        )
+        tk.Button(
+            intensity_controls,
+            text="+",
+            width=3,
+            command=lambda: self._step_vibration_intensity(VIBRATION_INTENSITY_STEP),
+        ).pack(side=tk.LEFT)
+        tk.Button(
+            intensity_controls,
+            text="Apply",
+            width=8,
+            command=self._apply_vibration_intensity,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        tk.Label(frame, text="Applied Intensity").grid(row=3, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.vibration_intensity_var).grid(
+            row=3, column=1, sticky="w"
+        )
+
+        tk.Label(frame, text="Phase Shift (ms)").grid(row=4, column=0, sticky="w")
         controls = tk.Frame(frame)
-        controls.grid(row=2, column=1, sticky="w")
+        controls.grid(row=4, column=1, sticky="w")
 
         tk.Button(
             controls,
@@ -656,6 +775,7 @@ class SubscriberControlUI:
         self.phase_entry = phase_entry
         phase_entry.pack(side=tk.LEFT, padx=6)
         phase_entry.bind("<Return>", lambda _event: self._apply_phase_shift())
+        phase_entry.bind("<KeyRelease>", lambda _event: self._mark_phase_entry_dirty())
         tk.Button(
             controls,
             text="+",
@@ -669,35 +789,79 @@ class SubscriberControlUI:
             command=self._apply_phase_shift,
         ).pack(side=tk.LEFT, padx=(8, 0))
 
-        tk.Label(frame, text="Applied Phase Shift").grid(row=3, column=0, sticky="w")
+        tk.Label(frame, text="Applied Phase Shift").grid(row=5, column=0, sticky="w")
         tk.Label(frame, textvariable=self.applied_phase_shift_var).grid(
-            row=3, column=1, sticky="w"
+            row=5, column=1, sticky="w"
         )
 
-        tk.Label(frame, text="Pending Phase Shift").grid(row=4, column=0, sticky="w")
+        tk.Label(frame, text="Pending Phase Shift").grid(row=6, column=0, sticky="w")
         tk.Label(frame, textvariable=self.pending_phase_shift_var).grid(
-            row=4, column=1, sticky="w"
+            row=6, column=1, sticky="w"
         )
 
-        tk.Label(frame, text="Last target_ms").grid(row=5, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.target_var).grid(row=5, column=1, sticky="w")
+        tk.Label(frame, text="Last target_ms").grid(row=7, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.target_var).grid(row=7, column=1, sticky="w")
 
-        tk.Label(frame, text="Last actual_ms").grid(row=6, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.actual_var).grid(row=6, column=1, sticky="w")
+        tk.Label(frame, text="Last actual_ms").grid(row=8, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.actual_var).grid(row=8, column=1, sticky="w")
 
-        tk.Label(frame, text="actual-target (ms)").grid(row=7, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.offset_var).grid(row=7, column=1, sticky="w")
+        tk.Label(frame, text="actual-target (ms)").grid(row=9, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.offset_var).grid(row=9, column=1, sticky="w")
 
-        tk.Label(frame, text="Last Event").grid(row=8, column=0, sticky="w")
+        tk.Label(frame, text="Last Event").grid(row=10, column=0, sticky="w")
         tk.Label(frame, textvariable=self.last_event_var, anchor="w").grid(
-            row=8, column=1, sticky="w"
+            row=10, column=1, sticky="w"
         )
 
         tk.Label(frame, textvariable=self.apply_status_var, fg="#1a5f7a").grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(8, 0)
+            row=11, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _clamp_vibration_intensity(self, value: int) -> int:
+        if value < VIBRATION_INTENSITY_MIN:
+            return VIBRATION_INTENSITY_MIN
+        if value > VIBRATION_INTENSITY_MAX:
+            return VIBRATION_INTENSITY_MAX
+        return value
+
+    def _parse_vibration_intensity_entry(self) -> int:
+        raw = self.vibration_intensity_entry_var.get().strip()
+        if not raw:
+            raise ValueError("vibration intensity is empty")
+        return int(raw)
+
+    def _step_vibration_intensity(self, step: int) -> None:
+        try:
+            current = self._parse_vibration_intensity_entry()
+        except ValueError:
+            snapshot = self.controller.get_status_snapshot()
+            current = int(snapshot["vibration_intensity"] or DEFAULT_VIBRATION_INTENSITY)
+        updated = self._clamp_vibration_intensity(current + step)
+        self.vibration_intensity_entry_var.set(str(updated))
+        self.vibration_intensity_entry_dirty = True
+
+    def _mark_vibration_intensity_entry_dirty(self) -> None:
+        self.vibration_intensity_entry_dirty = True
+
+    def _apply_vibration_intensity(self) -> None:
+        try:
+            requested = self._clamp_vibration_intensity(
+                self._parse_vibration_intensity_entry()
+            )
+            self.controller.set_vibration_intensity(requested)
+            self.vibration_intensity_entry_var.set(str(requested))
+            self.apply_status_var.set(f"Applied vibration_intensity={requested}")
+            self.vibration_intensity_entry_dirty = False
+        except ValueError as exc:
+            self.apply_status_var.set(f"Invalid vibration intensity: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Invalid vibration intensity", str(exc))
+        except Exception as exc:
+            self.apply_status_var.set(f"Failed to apply vibration intensity: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Apply failed", str(exc))
 
     def _clamp_phase_shift(self, value: int) -> int:
         if value < PHASE_SHIFT_MIN_MS:
@@ -720,6 +884,10 @@ class SubscriberControlUI:
             current = int(snapshot["effective_phase_shift_ms"] or 0)
         updated = self._clamp_phase_shift(current + step)
         self.phase_shift_entry_var.set(str(updated))
+        self.phase_entry_dirty = True
+
+    def _mark_phase_entry_dirty(self) -> None:
+        self.phase_entry_dirty = True
 
     def _apply_phase_shift(self) -> None:
         try:
@@ -727,6 +895,7 @@ class SubscriberControlUI:
             self.controller.set_phase_shift(requested)
             self.phase_shift_entry_var.set(str(requested))
             self.apply_status_var.set(f"Applied phase_shift_ms={requested}")
+            self.phase_entry_dirty = False
         except ValueError as exc:
             self.apply_status_var.set(f"Invalid phase shift: {exc}")
             if messagebox is not None:
@@ -741,6 +910,7 @@ class SubscriberControlUI:
 
         self.bpm_var.set(str(snapshot["current_bpm"]))
         self.run_state_var.set(str(snapshot["run_state"]))
+        self.vibration_intensity_var.set(str(snapshot["vibration_intensity"]))
         self.applied_phase_shift_var.set(str(snapshot["effective_phase_shift_ms"]))
         self.pending_phase_shift_var.set(str(snapshot["pending_phase_shift_ms"]))
         self.last_event_var.set(str(snapshot["last_event"]))
@@ -754,8 +924,10 @@ class SubscriberControlUI:
         else:
             self.offset_var.set(str(actual_ms - target_ms))
 
-        if self.root.focus_get() is not self.phase_entry:
+        if not self.phase_entry_dirty:
             self.phase_shift_entry_var.set(str(snapshot["effective_phase_shift_ms"]))
+        if not self.vibration_intensity_entry_dirty:
+            self.vibration_intensity_entry_var.set(str(snapshot["vibration_intensity"]))
 
         self.root.after(self.REFRESH_MS, self._refresh)
 

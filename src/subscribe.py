@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import signal
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
@@ -30,8 +32,12 @@ ENV_APP_ID = "BHAPTICS_APP_ID"
 ENV_API_KEY = "BHAPTICS_API_KEY"
 ENV_APP_NAME = "BHAPTICS_APP_NAME"
 DEFAULT_APP_NAME = "Hello, bHaptics!"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MOTOR_LEN = 32
 DEFAULT_BPM = 120
+START_DELAY_MS = 3000
+MIN_EPOCH_MS = 10**11
+STALE_START_THRESHOLD_MS = 5000
 
 
 @dataclass(frozen=True)
@@ -45,10 +51,25 @@ class BrokerConfig:
 
 
 def _load_dotenv(path: str = ENV_FILE) -> None:
-    try:
-        with open(path, encoding="utf-8") as file:
+    user_path = Path(path)
+    candidates = [user_path]
+    if not user_path.is_absolute():
+        candidates.append(PROJECT_ROOT / user_path)
+
+    lines: list[str] | None = None
+    seen_paths: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        if not candidate.is_file():
+            continue
+        with open(candidate, encoding="utf-8-sig") as file:
             lines = file.readlines()
-    except FileNotFoundError:
+        break
+
+    if lines is None:
         return
 
     for raw_line in lines:
@@ -108,13 +129,21 @@ def _parse_broker(value: str, fallback_port: int) -> tuple[str, int]:
     return host, port
 
 
-def _parse_run_payload(payload: str) -> int:
+def _parse_run_payload(payload: str) -> tuple[str, int | None]:
     normalized = payload.strip().lower()
-    if normalized in {"1", "true", "on", "start", "yes"}:
-        return 1
     if normalized in {"0", "false", "off", "stop", "no"}:
-        return 0
-    raise ValueError(f"invalid run payload: {payload!r}")
+        return "stop", None
+
+    try:
+        publish_ms = int(payload.strip())
+    except ValueError as exc:
+        raise ValueError(f"invalid run payload: {payload!r}") from exc
+
+    if publish_ms < MIN_EPOCH_MS:
+        raise ValueError(
+            f"invalid start timestamp (expected epoch-ms): {publish_ms}"
+        )
+    return "start", publish_ms
 
 
 class HapticsController:
@@ -131,6 +160,8 @@ class HapticsController:
         self.current_bpm = DEFAULT_BPM
         self.current_run = 0
         self.play_task: asyncio.Task[None] | None = None
+        self.scheduled_start_task: asyncio.Task[None] | None = None
+        self.current_schedule_id = 0
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
@@ -152,7 +183,7 @@ class HapticsController:
         while True:
             bpm = self.current_bpm
             beat_interval = 60.0 / bpm
-            values = [10] * MOTOR_LEN
+            values = [40] * MOTOR_LEN
             await bhaptics_python.play_dot(0, 100, values, -1)
             print("played haptic feedback")
 
@@ -176,29 +207,103 @@ class HapticsController:
             pass
         self.play_task = None
 
+    async def _cancel_scheduled_start_task(self) -> None:
+        if not self.scheduled_start_task or self.scheduled_start_task.done():
+            self.scheduled_start_task = None
+            return
+        self.scheduled_start_task.cancel()
+        try:
+            await self.scheduled_start_task
+        except asyncio.CancelledError:
+            pass
+        self.scheduled_start_task = None
+
+    async def _start_play_loop(self) -> None:
+        if self.play_task is None or self.play_task.done():
+            self.play_task = self.loop.create_task(self._play_loop())
+            print("play loop started")
+            return
+        print("play loop already running")
+
+    async def _run_scheduled_start(
+        self,
+        publish_ms: int,
+        target_ms: int,
+        schedule_id: int,
+    ) -> None:
+        initialize_task = self.loop.create_task(self._initialize())
+        try:
+            now_ms = int(time.time() * 1000)
+            delay_ms = target_ms - now_ms
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000.0)
+            await initialize_task
+
+            if schedule_id != self.current_schedule_id:
+                print(f"ignored stale scheduled start schedule_id={schedule_id}")
+                return
+            if self.current_run != 1:
+                print(f"ignored cancelled scheduled start schedule_id={schedule_id}")
+                return
+
+            actual_ms = int(time.time() * 1000)
+            print(
+                "scheduled start reached "
+                f"publish_ms={publish_ms} target_ms={target_ms} actual_ms={actual_ms}"
+            )
+            await self._start_play_loop()
+        except asyncio.CancelledError:
+            if not initialize_task.done():
+                initialize_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await initialize_task
+            raise
+
     async def _set_bpm_async(self, bpm: int) -> None:
         if bpm <= 0:
             raise ValueError("bpm must be a positive integer")
         self.current_bpm = bpm
         print(f"updated bpm={bpm}")
 
-    async def _set_run_async(self, run: int) -> None:
-        self.current_run = run
-        print(f"updated run={run}")
-        await self._initialize()
-
-        if run == 1:
-            if self.play_task is None or self.play_task.done():
-                self.play_task = self.loop.create_task(self._play_loop())
-                print("play loop started")
-            return
-
+    async def _stop_async(self) -> None:
+        self.current_run = 0
+        print("updated run=0")
+        self.current_schedule_id += 1
+        await self._cancel_scheduled_start_task()
         await self._cancel_play_task()
         if self.initialized:
             await bhaptics_python.stop_all()
             print("play loop stopped")
 
+    async def _schedule_start_async(self, publish_ms: int) -> None:
+        target_ms = (publish_ms // 1000) * 1000 + START_DELAY_MS
+        now_ms = int(time.time() * 1000)
+        lag_ms = now_ms - target_ms
+        if lag_ms > STALE_START_THRESHOLD_MS:
+            print(
+                "ignored stale start timestamp "
+                f"publish_ms={publish_ms} target_ms={target_ms} lag_ms={lag_ms}"
+            )
+            return
+
+        self.current_run = 1
+        self.current_schedule_id += 1
+        schedule_id = self.current_schedule_id
+        await self._cancel_scheduled_start_task()
+        self.scheduled_start_task = self.loop.create_task(
+            self._run_scheduled_start(publish_ms, target_ms, schedule_id)
+        )
+
+        delay_ms = max(0, target_ms - now_ms)
+        print(
+            "scheduled start "
+            f"publish_ms={publish_ms} target_ms={target_ms} "
+            f"delay_ms={delay_ms} schedule_id={schedule_id}"
+        )
+
     async def _close_async(self) -> None:
+        self.current_schedule_id += 1
+        await self._cancel_scheduled_start_task()
         await self._cancel_play_task()
         if self.initialized:
             await bhaptics_python.stop_all()
@@ -209,8 +314,15 @@ class HapticsController:
         future = asyncio.run_coroutine_threadsafe(self._set_bpm_async(bpm), self.loop)
         future.result(timeout=timeout)
 
-    def set_run(self, run: int, timeout: float = 5.0) -> None:
-        future = asyncio.run_coroutine_threadsafe(self._set_run_async(run), self.loop)
+    def stop(self, timeout: float = 5.0) -> None:
+        future = asyncio.run_coroutine_threadsafe(self._stop_async(), self.loop)
+        future.result(timeout=timeout)
+
+    def schedule_start(self, publish_ms: int, timeout: float = 5.0) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            self._schedule_start_async(publish_ms),
+            self.loop,
+        )
         future.result(timeout=timeout)
 
     def close(self) -> None:
@@ -232,8 +344,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--broker",
-        default="mqtt.makinteract.com",
-        help="MQTT broker host or URL (default: mqtt.makinteract.com)",
+        default="mqtt-web.makinteract.com",
+        help="MQTT broker host or URL (default: mqtt-web.makinteract.com)",
     )
     parser.add_argument(
         "--port",
@@ -326,8 +438,13 @@ def main() -> int:
                 return
 
             if msg.topic == TOPIC_RUN:
-                run = _parse_run_payload(payload)
-                controller.set_run(run)
+                action, publish_ms = _parse_run_payload(payload)
+                if action == "stop":
+                    controller.stop()
+                else:
+                    if publish_ms is None:
+                        raise ValueError("missing start timestamp")
+                    controller.schedule_start(publish_ms)
                 return
 
             print(f"ignored unknown topic: {msg.topic}")

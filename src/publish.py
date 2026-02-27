@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from dataclasses import dataclass
 from threading import Event
 from urllib.parse import urlparse
@@ -50,8 +51,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--broker",
-        default="mqtt.makinteract.com",
-        help="MQTT broker host or URL (default: mqtt.makinteract.com)",
+        default="mqtt-web.makinteract.com",
+        help="MQTT broker host or URL (default: mqtt-web.makinteract.com)",
     )
     parser.add_argument(
         "--port",
@@ -84,7 +85,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--run",
         type=int,
         choices=[0, 1],
-        help="Value for /bhaptics/run (0 or 1)",
+        help="Run command (0=stop now, 1=publish current epoch-ms as start timestamp)",
     )
     return parser
 
@@ -167,6 +168,12 @@ def _publish_value(
         raise RuntimeError(f"failed to publish {topic}: rc={info.rc}")
 
 
+def _resolve_run_payload(run: int) -> int:
+    if run == 0:
+        return 0
+    return int(time.time() * 1000)
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -196,8 +203,12 @@ def main() -> int:
             print(f"published {TOPIC_BPM}={args.bpm}")
 
         if args.run is not None:
-            _publish_value(client, TOPIC_RUN, args.run, config.qos, config.retain)
-            print(f"published {TOPIC_RUN}={args.run}")
+            run_payload = _resolve_run_payload(args.run)
+            _publish_value(client, TOPIC_RUN, run_payload, config.qos, config.retain)
+            if args.run == 1:
+                print(f"published {TOPIC_RUN} start_ts_ms={run_payload}")
+            else:
+                print(f"published {TOPIC_RUN}=0")
 
         return 0
     except Exception as exc:

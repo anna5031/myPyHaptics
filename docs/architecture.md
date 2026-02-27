@@ -22,28 +22,29 @@ Note: MQTT clients usually connect with `mqtt://`, `tcp://`, or `wss://` endpoin
   - Meaning: start scheduling / stop command
   - Payload:
     - `0`: stop now
-    - `<unix_epoch_milliseconds>`: start trigger timestamp from publisher
+    - `<unix_epoch_milliseconds>`: absolute target start time from publisher
   - Rule:
-    - If payload is timestamp, subscriber computes `target_ms = (publish_ms // 1000) * 1000 + 3000`
-    - Vibration starts at `target_ms` (floor to second, then +3s)
+    - Publisher computes target time as `target_ms = floor(current_time_ms to second) + delay_s * 1000`
+    - Subscriber starts vibration at payload target time (with optional local `phase_shift_ms` compensation)
 
 ## 4) Component Responsibilities
 ### A. Publisher (`src/publish.py`)
 - Publish BPM to `/bhaptics/bpm`
 - Publish stop (`0`) or start timestamp (`unix_epoch_milliseconds`) to `/bhaptics/run`
+- For delayed start, compute target timestamp on publisher and publish immediately
 - Forward external control input (UI/CLI/test script) to MQTT
 
 ### B. Subscriber (`src/subscribe.py`)
 - Subscribe to `/bhaptics/bpm` and `/bhaptics/run`
 - Keep latest BPM in memory
-- For start timestamp payload, schedule `_play_loop` at computed target time
+- For start timestamp payload, schedule `_play_loop` at payload target time
 - For stop payload (`0`), cancel scheduled start and stop playback
 - Manage both scheduling and playback task lifecycle to prevent duplicates
 
 ## 5) Intended Runtime Sequence
 1. Publisher sends BPM on `/bhaptics/bpm`
-2. Publisher sends current clock time in epoch-ms on `/bhaptics/run` (start request)
-3. Subscriber computes `target_ms = floor_to_second(publish_ms) + 3000ms`
+2. Publisher computes `target_ms = floor_to_second(now) + delay_s` and publishes it on `/bhaptics/run`
+3. Subscriber receives target timestamp payload
 4. Subscriber waits until `target_ms`
 5. Subscriber starts `_play_loop` with latest BPM
 6. Later BPM updates are reflected on subsequent loop intervals (exact implementation detail to be finalized in code)
@@ -74,10 +75,10 @@ Core invariants:
 - `src/publish.py`
   - MQTT client connect/reconnect
   - Helper functions to publish both topics
-  - On start command, publish current epoch-ms instead of `1`
+  - On delayed start command, publish computed target epoch-ms
 - `src/subscribe.py`
   - Subscription callbacks for both topics
-  - Timestamp-based start scheduling (`floor-second + 3s`)
+  - Timestamp-based start scheduling from payload target time
   - Reservation task cancellation/replacement on newer start timestamp
   - Duplicate-task prevention and stop handling
 

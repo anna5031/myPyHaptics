@@ -202,7 +202,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ui",
         action="store_true",
-        help="Launch interactive publisher UI",
+        help="Force interactive publisher UI",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without UI (CLI publish mode)",
     )
     parser.add_argument("--bpm", type=int, help="Value for /bhaptics/bpm")
     parser.add_argument(
@@ -312,8 +317,12 @@ def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
 
-    if not args.ui and args.bpm is None and args.run is None and args.delay_s is None:
-        parser.error("at least one of --bpm, --run, or --delay-s is required")
+    has_cli_publish_args = (
+        args.bpm is not None or args.run is not None or args.delay_s is not None
+    )
+    launch_ui = (not args.headless) and (args.ui or not has_cli_publish_args)
+    if not launch_ui and not has_cli_publish_args:
+        parser.error("at least one of --bpm, --run, or --delay-s is required in headless mode")
     if args.bpm is not None and args.bpm <= 0:
         parser.error("--bpm must be a positive integer")
     if args.delay_s is not None and args.delay_s < 0:
@@ -336,13 +345,17 @@ def main() -> int:
     try:
         client = _connect_client(config)
 
-        if args.ui:
+        if launch_ui:
             if tk is None:
-                raise RuntimeError("tkinter is not available")
-            root = tk.Tk()
-            PublishUI(root=root, client=client, config=config)
-            root.mainloop()
-            return 0
+                if has_cli_publish_args:
+                    print("warning: tkinter is not available, falling back to headless mode")
+                else:
+                    raise RuntimeError("tkinter is not available")
+            else:
+                root = tk.Tk()
+                PublishUI(root=root, client=client, config=config)
+                root.mainloop()
+                return 0
 
         if args.bpm is not None:
             _publish_value(client, TOPIC_BPM, args.bpm, config.qos, config.retain)

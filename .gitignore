@@ -3,3 +3,11 @@
 !.env.example
 __pycache__/
 *.pyc
+.venv311
+
+# Build artifacts
+build/
+build311/
+dist/
+dist311/
+release/*.exe

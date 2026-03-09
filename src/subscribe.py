@@ -540,6 +540,18 @@ class HapticsController:
         if last_payload_target_ms is not None:
             await self._schedule_start_async(last_payload_target_ms)
 
+    async def _shift_phase_async(self, delta_ms: int) -> None:
+        if delta_ms == 0:
+            return
+        with self._status_lock:
+            effective = self.phase_shift_ms + self.session_phase_shift_delta_ms
+        requested = effective + delta_ms
+        if requested < PHASE_SHIFT_MIN_MS:
+            requested = PHASE_SHIFT_MIN_MS
+        elif requested > PHASE_SHIFT_MAX_MS:
+            requested = PHASE_SHIFT_MAX_MS
+        await self._set_phase_shift_async(requested)
+
     async def _stop_async(self) -> None:
         self.current_run = 0
         self.current_schedule_id += 1
@@ -629,6 +641,13 @@ class HapticsController:
         )
         future.result(timeout=timeout)
 
+    def shift_phase(self, delta_ms: int, timeout: float = 5.0) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            self._shift_phase_async(delta_ms),
+            self.loop,
+        )
+        future.result(timeout=timeout)
+
     def stop(self, timeout: float = 5.0) -> None:
         future = asyncio.run_coroutine_threadsafe(self._stop_async(), self.loop)
         future.result(timeout=timeout)
@@ -687,7 +706,6 @@ class SubscriberControlUI:
         self.vibration_intensity_entry_var = tk.StringVar(
             value=str(DEFAULT_VIBRATION_INTENSITY)
         )
-        self.phase_shift_entry_var = tk.StringVar(value="0")
         self.applied_phase_shift_var = tk.StringVar(value="-")
         self.pending_phase_shift_var = tk.StringVar(value="-")
         self.target_var = tk.StringVar(value="-")
@@ -696,7 +714,6 @@ class SubscriberControlUI:
         self.last_event_var = tk.StringVar(value="-")
         self.apply_status_var = tk.StringVar(value="")
         self.vibration_intensity_entry_dirty = False
-        self.phase_entry_dirty = False
 
         self._build_layout()
         self._refresh()
@@ -757,37 +774,24 @@ class SubscriberControlUI:
         )
 
         tk.Label(frame, text="Phase Shift (ms)").grid(row=4, column=0, sticky="w")
-        controls = tk.Frame(frame)
-        controls.grid(row=4, column=1, sticky="w")
-
+        phase_controls = tk.Frame(frame)
+        phase_controls.grid(row=4, column=1, sticky="w")
         tk.Button(
-            controls,
-            text="-",
-            width=3,
-            command=lambda: self._step_phase_shift(-PHASE_SHIFT_STEP_MS),
-        ).pack(side=tk.LEFT)
-        phase_entry = tk.Entry(
-            controls,
-            textvariable=self.phase_shift_entry_var,
+            phase_controls,
+            text="Slower",
             width=10,
-            justify="right",
-        )
-        self.phase_entry = phase_entry
-        phase_entry.pack(side=tk.LEFT, padx=6)
-        phase_entry.bind("<Return>", lambda _event: self._apply_phase_shift())
-        phase_entry.bind("<KeyRelease>", lambda _event: self._mark_phase_entry_dirty())
-        tk.Button(
-            controls,
-            text="+",
-            width=3,
-            command=lambda: self._step_phase_shift(PHASE_SHIFT_STEP_MS),
+            command=lambda: self._shift_phase(-PHASE_SHIFT_STEP_MS),
         ).pack(side=tk.LEFT)
         tk.Button(
-            controls,
-            text="Apply",
-            width=8,
-            command=self._apply_phase_shift,
+            phase_controls,
+            text="Faster",
+            width=10,
+            command=lambda: self._shift_phase(PHASE_SHIFT_STEP_MS),
         ).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(
+            phase_controls,
+            text=f"step {PHASE_SHIFT_STEP_MS}ms",
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         tk.Label(frame, text="Applied Phase Shift").grid(row=5, column=0, sticky="w")
         tk.Label(frame, textvariable=self.applied_phase_shift_var).grid(
@@ -863,39 +867,14 @@ class SubscriberControlUI:
             if messagebox is not None:
                 messagebox.showerror("Apply failed", str(exc))
 
-    def _clamp_phase_shift(self, value: int) -> int:
-        if value < PHASE_SHIFT_MIN_MS:
-            return PHASE_SHIFT_MIN_MS
-        if value > PHASE_SHIFT_MAX_MS:
-            return PHASE_SHIFT_MAX_MS
-        return value
-
-    def _parse_phase_shift_entry(self) -> int:
-        raw = self.phase_shift_entry_var.get().strip()
-        if not raw:
-            raise ValueError("phase shift is empty")
-        return int(raw)
-
-    def _step_phase_shift(self, step: int) -> None:
+    def _shift_phase(self, delta_ms: int) -> None:
         try:
-            current = self._parse_phase_shift_entry()
-        except ValueError:
+            self.controller.shift_phase(delta_ms)
             snapshot = self.controller.get_status_snapshot()
-            current = int(snapshot["effective_phase_shift_ms"] or 0)
-        updated = self._clamp_phase_shift(current + step)
-        self.phase_shift_entry_var.set(str(updated))
-        self.phase_entry_dirty = True
-
-    def _mark_phase_entry_dirty(self) -> None:
-        self.phase_entry_dirty = True
-
-    def _apply_phase_shift(self) -> None:
-        try:
-            requested = self._clamp_phase_shift(self._parse_phase_shift_entry())
-            self.controller.set_phase_shift(requested)
-            self.phase_shift_entry_var.set(str(requested))
-            self.apply_status_var.set(f"Applied phase_shift_ms={requested}")
-            self.phase_entry_dirty = False
+            self.apply_status_var.set(
+                "Applied phase shift "
+                f"delta={delta_ms:+d}ms effective={snapshot['effective_phase_shift_ms']}ms"
+            )
         except ValueError as exc:
             self.apply_status_var.set(f"Invalid phase shift: {exc}")
             if messagebox is not None:
@@ -924,8 +903,6 @@ class SubscriberControlUI:
         else:
             self.offset_var.set(str(actual_ms - target_ms))
 
-        if not self.phase_entry_dirty:
-            self.phase_shift_entry_var.set(str(snapshot["effective_phase_shift_ms"]))
         if not self.vibration_intensity_entry_dirty:
             self.vibration_intensity_entry_var.set(str(snapshot["vibration_intensity"]))
 

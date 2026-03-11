@@ -35,6 +35,8 @@ SUBSCRIBER_ID = 1
 
 TOPIC_BPM = "bhaptics/bpm"
 TOPIC_RUN = "bhaptics/run"
+ACK_START_ACCEPTED = "0"
+ACK_START_REJECTED_LATE = "-1"
 
 ENV_FILE = ".env"
 ENV_APP_ID = "BHAPTICS_APP_ID"
@@ -45,8 +47,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MOTOR_LEN = 32
 DEFAULT_BPM = 120
 MIN_EPOCH_MS = 10**11
-STALE_START_THRESHOLD_MS = 5000
-
 DEFAULT_CONFIG_DB_NAME = "config.db"
 DEFAULT_CONFIG_DIRNAME = "myPyHaptics"
 DEFAULT_VIBRATION_INTENSITY = 20
@@ -56,6 +56,7 @@ VIBRATION_INTENSITY_STEP = 5
 PHASE_SHIFT_MIN_MS = -2000
 PHASE_SHIFT_MAX_MS = 2000
 PHASE_SHIFT_STEP_MS = 5
+SCHEDULER_COARSE_GUARD_S = 0.005
 
 
 def _default_config_db_path() -> Path:
@@ -377,8 +378,32 @@ class HapticsController:
         print(f"bHaptics initialization result: {result}")
         self.initialized = True
 
-    async def _play_loop(self) -> None:
-        next_tick = time.perf_counter()
+    async def _recover_and_initialize_async(self) -> bool:
+        self.current_run = 0
+        self.current_schedule_id += 1
+        self._set_run_state("stopped")
+        self._set_last_event("recovering haptics initialization")
+        await self._cancel_scheduled_start_task()
+        await self._cancel_play_task()
+        if self.initialized:
+            with contextlib.suppress(Exception):
+                await bhaptics_python.stop_all()
+        self.initialized = False
+        try:
+            await self._initialize()
+        except Exception as exc:
+            self._set_last_event(f"failed to recover initialization: {exc}")
+            print(f"failed to recover initialization: {exc}")
+            return False
+        self._set_last_event("recovered initialization; retry start")
+        print("recovered initialization; start request was rejected")
+        return True
+
+    async def _play_loop(self, first_tick: float | None = None) -> None:
+        if first_tick is None:
+            next_tick = time.perf_counter()
+        else:
+            next_tick = first_tick
         while True:
             shift_ms = self._consume_pending_phase_shift_ms()
             if shift_ms != 0:
@@ -386,22 +411,30 @@ class HapticsController:
                 print(f"applied pending phase shift shift_ms={shift_ms}")
                 self._set_last_event(f"applied pending phase shift shift_ms={shift_ms}")
 
+            await self._wait_until_tick(next_tick)
+
             bpm = self.current_bpm
             with self._status_lock:
                 intensity = self.vibration_intensity
             beat_interval = 60.0 / bpm
             values = [intensity] * MOTOR_LEN
             await bhaptics_python.play_dot(0, 100, values, -1)
-            print("played haptic feedback")
 
             next_tick += beat_interval
             now = time.perf_counter()
-            sleep_time = next_tick - now
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-            else:
-                while next_tick <= now:
-                    next_tick += beat_interval
+            if next_tick <= now:
+                skipped = int((now - next_tick) // beat_interval) + 1
+                next_tick += skipped * beat_interval
+
+    async def _wait_until_tick(self, target_tick: float) -> None:
+        while True:
+            remaining = target_tick - time.perf_counter()
+            if remaining <= 0:
+                return
+            if remaining > SCHEDULER_COARSE_GUARD_S:
+                await asyncio.sleep(remaining - SCHEDULER_COARSE_GUARD_S)
+                continue
+            await asyncio.sleep(0)
 
     async def _cancel_play_task(self) -> None:
         if not self.play_task or self.play_task.done():
@@ -425,9 +458,9 @@ class HapticsController:
             pass
         self.scheduled_start_task = None
 
-    async def _start_play_loop(self) -> None:
+    async def _start_play_loop(self, first_tick: float | None = None) -> None:
         if self.play_task is None or self.play_task.done():
-            self.play_task = self.loop.create_task(self._play_loop())
+            self.play_task = self.loop.create_task(self._play_loop(first_tick=first_tick))
             self._set_run_state("running")
             self._set_last_event("play loop started")
             print("play loop started")
@@ -440,13 +473,12 @@ class HapticsController:
         target_ms: int,
         schedule_id: int,
     ) -> None:
-        initialize_task = self.loop.create_task(self._initialize())
         try:
             now_ms = int(time.time() * 1000)
             delay_ms = target_ms - now_ms
+            target_tick = time.perf_counter() + max(0.0, delay_ms / 1000.0)
             if delay_ms > 0:
-                await asyncio.sleep(delay_ms / 1000.0)
-            await initialize_task
+                await self._wait_until_tick(target_tick)
 
             if schedule_id != self.current_schedule_id:
                 print(f"ignored stale scheduled start schedule_id={schedule_id}")
@@ -466,12 +498,8 @@ class HapticsController:
                 "scheduled start reached "
                 f"target_ms={target_ms} actual_ms={actual_ms}"
             )
-            await self._start_play_loop()
+            await self._start_play_loop(first_tick=target_tick)
         except asyncio.CancelledError:
-            if not initialize_task.done():
-                initialize_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await initialize_task
             raise
 
     async def _set_bpm_async(self, bpm: int) -> None:
@@ -567,21 +595,27 @@ class HapticsController:
 
         self._commit_session_phase_shift()
 
-    async def _schedule_start_async(self, payload_target_ms: int) -> None:
+    async def _schedule_start_async(self, payload_target_ms: int) -> bool:
+        if not self.initialized:
+            recovered = await self._recover_and_initialize_async()
+            if not recovered:
+                return False
+            return False
+
         target_ms = self._compute_target_ms(payload_target_ms)
         now_ms = int(time.time() * 1000)
         lag_ms = now_ms - target_ms
-        if lag_ms > STALE_START_THRESHOLD_MS:
+        if lag_ms > 0:
             print(
-                "ignored stale start timestamp "
+                "rejected late start timestamp "
                 f"payload_target_ms={payload_target_ms} "
                 f"target_ms={target_ms} lag_ms={lag_ms}"
             )
             self._set_last_event(
-                "ignored stale start timestamp "
+                "rejected late start timestamp "
                 f"payload_target_ms={payload_target_ms} lag_ms={lag_ms}"
             )
-            return
+            return False
 
         self.current_run = 1
         self.current_schedule_id += 1
@@ -606,6 +640,7 @@ class HapticsController:
             "scheduled start "
             f"target_ms={target_ms} delay_ms={delay_ms} phase_shift_ms={effective_shift}"
         )
+        return True
 
     async def _close_async(self) -> None:
         self.current_run = 0
@@ -652,12 +687,16 @@ class HapticsController:
         future = asyncio.run_coroutine_threadsafe(self._stop_async(), self.loop)
         future.result(timeout=timeout)
 
-    def schedule_start(self, payload_target_ms: int, timeout: float = 5.0) -> None:
+    def initialize(self, timeout: float = 5.0) -> None:
+        future = asyncio.run_coroutine_threadsafe(self._initialize(), self.loop)
+        future.result(timeout=timeout)
+
+    def schedule_start(self, payload_target_ms: int, timeout: float = 5.0) -> bool:
         future = asyncio.run_coroutine_threadsafe(
             self._schedule_start_async(payload_target_ms),
             self.loop,
         )
-        future.result(timeout=timeout)
+        return future.result(timeout=timeout)
 
     def get_status_snapshot(self) -> dict[str, int | str | None]:
         with self._status_lock:
@@ -953,11 +992,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=str(_default_config_db_path()),
         help="SQLite config file path (default: %%APPDATA%%/myPyHaptics/config.db)",
     )
+    parser.add_argument(
+        "--subscriber-id",
+        type=int,
+        default=SUBSCRIBER_ID,
+        help="Subscriber ID used for ACK topic suffix (default: 1)",
+    )
     return parser
 
 
 def main() -> int:
     args = _build_parser().parse_args()
+    if args.subscriber_id <= 0:
+        print("error: --subscriber-id must be a positive integer")
+        return 1
     if bhaptics_python is None:
         print(f"error: missing dependency 'bhaptics_python' ({_BHAPTICS_IMPORT_ERROR})")
         return 1
@@ -979,6 +1027,14 @@ def main() -> int:
 
     config_store = ConfigStore(Path(args.config_db))
     controller = HapticsController(app_id, api_key, app_name, config_store)
+    ack_topic = f"bhaptics/ack{args.subscriber_id}"
+    print(f"using ACK topic: {ack_topic}")
+    try:
+        controller.initialize(timeout=10.0)
+    except Exception as exc:
+        print(f"error: failed to initialize bHaptics before start: {exc}")
+        controller.close()
+        return 1
     stop_event = threading.Event()
     connect_event = threading.Event()
     connect_error: list[str] = []
@@ -1039,7 +1095,18 @@ def main() -> int:
                 else:
                     if payload_target_ms is None:
                         raise ValueError("missing start timestamp")
-                    controller.schedule_start(payload_target_ms)
+                    accepted = controller.schedule_start(payload_target_ms)
+                    ack_payload = (
+                        ACK_START_ACCEPTED if accepted else ACK_START_REJECTED_LATE
+                    )
+                    info = _client.publish(
+                        ack_topic,
+                        payload=ack_payload,
+                        qos=config.qos,
+                        retain=False,
+                    )
+                    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                        print(f"failed to publish {ack_topic}={ack_payload}: rc={info.rc}")
                 return
 
             print(f"ignored unknown topic: {msg.topic}")

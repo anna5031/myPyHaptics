@@ -19,6 +19,11 @@ except ModuleNotFoundError:
 
 TOPIC_BPM = "bhaptics/bpm"
 TOPIC_RUN = "bhaptics/run"
+ACK_START_ACCEPTED = "0"
+ACK_START_REJECTED_LATE = "-1"
+ACK_TOPIC_PREFIX = "bhaptics/ack"
+ACK_TOPIC_ALL = "bhaptics/#"
+DEFAULT_SUBSCRIBER_ID = 0
 
 
 @dataclass(frozen=True)
@@ -33,10 +38,17 @@ class BrokerConfig:
 
 
 class PublishUI:
-    def __init__(self, root: tk.Tk, client: mqtt.Client, config: BrokerConfig) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        client: mqtt.Client,
+        config: BrokerConfig,
+        ack_topic_filter: str,
+    ) -> None:
         self.root = root
         self.client = client
         self.config = config
+        self.ack_topic_filter = ack_topic_filter
         self.status_var = tk.StringVar(value="ready")
         self.bpm_var = tk.StringVar(value="120")
         self.delay_var = tk.StringVar(value="3")
@@ -92,6 +104,13 @@ class PublishUI:
 
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
+
+    def handle_ack(self, topic: str, payload: str) -> None:
+        if payload == ACK_START_REJECTED_LATE:
+            self._set_status(f"[{topic}] error: increase start delay")
+            return
+        if payload == ACK_START_ACCEPTED:
+            self._set_status(f"[{topic}] ack: start accepted")
 
     def _publish_bpm(self) -> None:
         try:
@@ -222,6 +241,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[0, 1],
         help="Run command (0=stop now, 1=start using target timestamp payload)",
     )
+    parser.add_argument(
+        "--subscriber-id",
+        type=int,
+        default=DEFAULT_SUBSCRIBER_ID,
+        help="ACK target subscriber ID (0=listen all ACK topics, default: 0)",
+    )
     return parser
 
 
@@ -329,8 +354,14 @@ def main() -> int:
         parser.error("--delay-s must be >= 0")
     if args.delay_s is not None and args.run == 0:
         parser.error("--delay-s cannot be used with --run 0")
+    if args.subscriber_id < 0:
+        parser.error("--subscriber-id must be >= 0")
 
     host, port = _parse_broker(args.broker, args.port)
+    if args.subscriber_id == 0:
+        ack_topic_filter = ACK_TOPIC_ALL
+    else:
+        ack_topic_filter = f"{ACK_TOPIC_PREFIX}{args.subscriber_id}"
     config = BrokerConfig(
         host=host,
         port=port,
@@ -353,7 +384,32 @@ def main() -> int:
                     raise RuntimeError("tkinter is not available")
             else:
                 root = tk.Tk()
-                PublishUI(root=root, client=client, config=config)
+                ui = PublishUI(
+                    root=root,
+                    client=client,
+                    config=config,
+                    ack_topic_filter=ack_topic_filter,
+                )
+
+                def on_message(
+                    _client: mqtt.Client,
+                    _userdata: object,
+                    msg: mqtt.MQTTMessage,
+                ) -> None:
+                    if not msg.topic.startswith(ACK_TOPIC_PREFIX):
+                        return
+                    payload = msg.payload.decode("utf-8", errors="ignore").strip()
+                    if root.winfo_exists():
+                        root.after(0, ui.handle_ack, msg.topic, payload)
+
+                client.on_message = on_message
+                subscribe_result, _mid = client.subscribe([(ack_topic_filter, config.qos)])
+                if subscribe_result != mqtt.MQTT_ERR_SUCCESS:
+                    ui._set_status(
+                        f"failed to subscribe {ack_topic_filter}: rc={subscribe_result}"
+                    )
+                else:
+                    ui._set_status(f"listening for ACK on {ack_topic_filter}")
                 root.mainloop()
                 return 0
 

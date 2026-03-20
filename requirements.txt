@@ -3,3 +3,4 @@ paho-mqtt==2.1.0
 python-dotenv==1.2.2
 pytest==9.0.2
 pytest-asyncio==1.3.0
+bhaptics_python==0.2.0

@@ -1,6 +1,5 @@
 import asyncio
 
-from mqtt import topic
 from mqtt.handler import CommandHandler
 from mqtt.subscriber import MQTTSubscriber
 
@@ -8,7 +7,7 @@ from mqtt.subscriber import MQTTSubscriber
 async def main():
     sub = MQTTSubscriber()
     handler = CommandHandler()
-    sub.subscribe(topic.COMMAND, handler.handle)
+    sub.subscribe(CommandHandler.TOPIC, handler.handle)
     
     try:
         await sub.connect()

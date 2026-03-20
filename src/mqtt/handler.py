@@ -1,9 +1,15 @@
 import json
 
 from mqtt.message import StartMessage, StopMessage
+from scheduler.scheduler import Scheduler
 
 
 class CommandHandler:
+    TOPIC = "bHaptics/command"
+
+    def __init__(self):
+        self.scheduler = Scheduler()
+
     async def handle(self, payload: str):
         command = json.loads(payload).get("command")
         if command == "start":
@@ -14,7 +20,13 @@ class CommandHandler:
             print(f"[CommandHandler] Unknown command: {command!r}")
 
     async def _on_start(self, msg: StartMessage):
-        print(f"[CommandHandler] Start — bpm={msg.bpm}, time={msg.time}")
+        def callback():
+            print(f"[CommandHandler] Executed scheduled start for bpm={msg.bpm} at time={msg.time}!")
+
+        self.scheduler.schedule(
+            msg.time,
+            callback
+        )
 
     async def _on_stop(self, msg: StopMessage):
         print("[CommandHandler] Stop")

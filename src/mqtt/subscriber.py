@@ -32,13 +32,6 @@ class MQTTSubscriber:
             print(f"[MQTT] Subscribed → {topic}")
         print(f"[MQTT] Connected to {self._address}:{self._port}")
 
-    async def disconnect(self):
-        """Disconnect from the broker."""
-        if self._client is not None:
-            await self._client.__aexit__(None, None, None)
-            self._client = None
-            print("[MQTT] Disconnected")
-
     async def listen(self):
         """Listen for messages indefinitely. Call connect() first."""
         assert self._client is not None, "Call connect() before listen()"
@@ -46,5 +39,14 @@ class MQTTSubscriber:
             topic = str(message.topic)
             payload = message.payload.decode("utf-8", errors="replace")
             print(f"[MQTT] {topic}: {payload}")
+            
             handlers = self._handlers.get(topic, [])
-            await asyncio.gather(*(h(payload) for h in handlers))
+            for h in handlers:
+                asyncio.create_task(h(payload))
+
+    async def disconnect(self):
+        """Disconnect from the broker."""
+        if self._client is not None:
+            await self._client.__aexit__(None, None, None)
+            self._client = None
+            print("[MQTT] Disconnected")

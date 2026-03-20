@@ -1,1 +1,1 @@
-COMMAND="bHaptics/command"
+COMMAND = "bHaptics/command"

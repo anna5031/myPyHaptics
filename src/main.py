@@ -1,15 +1,20 @@
 import asyncio
 
+from mqtt import topic
+from mqtt.handler import CommandHandler
 from mqtt.subscriber import MQTTSubscriber
 
 
 async def main():
     sub = MQTTSubscriber()
-
-    # Register topics and handlers here, e.g.:
-    # sub.subscribe("/haptics/vest", on_vest_message)
-
-    await sub.run()
+    handler = CommandHandler()
+    sub.subscribe(topic.COMMAND, handler.handle)
+    
+    try:
+        await sub.connect()
+        await sub.listen()
+    finally:
+        await sub.disconnect()
 
 
 if __name__ == "__main__":

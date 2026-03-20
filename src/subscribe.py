@@ -42,6 +42,7 @@ ENV_FILE = ".env"
 ENV_APP_ID = "BHAPTICS_APP_ID"
 ENV_API_KEY = "BHAPTICS_API_KEY"
 ENV_APP_NAME = "BHAPTICS_APP_NAME"
+ENV_SUBSCRIBER_ID = "BHAPTICS_SUBSCRIBER_ID"
 DEFAULT_APP_NAME = "Hello, bHaptics!"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MOTOR_LEN = 32
@@ -57,6 +58,9 @@ PHASE_SHIFT_MIN_MS = -2000
 PHASE_SHIFT_MAX_MS = 2000
 PHASE_SHIFT_STEP_MS = 5
 SCHEDULER_COARSE_GUARD_S = 0.005
+SCHEDULER_SPIN_GUARD_S = 0.0015
+MAX_PENDING_PLAY_DOT_TASKS = 4
+CLOCK_DRIFT_REANCHOR_THRESHOLD_S = 0.0005
 
 
 def _default_config_db_path() -> Path:
@@ -102,13 +106,13 @@ class ConfigStore:
             )
             conn.commit()
 
-    def load_phase_shift_ms(self, default: int = 0) -> int:
+    def _load_int(self, key: str, default: int) -> int:
         with self._lock:
             self._initialize()
             with self._connect() as conn:
                 cursor = conn.execute(
                     "SELECT value FROM app_config WHERE key = ?",
-                    ("phase_shift_ms",),
+                    (key,),
                 )
                 row = cursor.fetchone()
                 if row is None:
@@ -117,54 +121,34 @@ class ConfigStore:
                     return int(row[0])
                 except (TypeError, ValueError):
                     return default
+
+    def _save_value(self, key: str, value: int) -> None:
+        with self._lock:
+            self._initialize()
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO app_config(key, value, updated_at)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, str(value), _utc_now_iso()),
+                )
+                conn.commit()
+
+    def load_phase_shift_ms(self, default: int = 0) -> int:
+        return self._load_int("phase_shift_ms", default)
 
     def save_phase_shift_ms(self, value: int) -> None:
-        with self._lock:
-            self._initialize()
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO app_config(key, value, updated_at)
-                    VALUES(?, ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET
-                        value = excluded.value,
-                        updated_at = excluded.updated_at
-                    """,
-                    ("phase_shift_ms", str(value), _utc_now_iso()),
-                )
-                conn.commit()
+        self._save_value("phase_shift_ms", value)
 
     def load_vibration_intensity(self, default: int = DEFAULT_VIBRATION_INTENSITY) -> int:
-        with self._lock:
-            self._initialize()
-            with self._connect() as conn:
-                cursor = conn.execute(
-                    "SELECT value FROM app_config WHERE key = ?",
-                    ("vibration_intensity",),
-                )
-                row = cursor.fetchone()
-                if row is None:
-                    return default
-                try:
-                    return int(row[0])
-                except (TypeError, ValueError):
-                    return default
+        return self._load_int("vibration_intensity", default)
 
     def save_vibration_intensity(self, value: int) -> None:
-        with self._lock:
-            self._initialize()
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO app_config(key, value, updated_at)
-                    VALUES(?, ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET
-                        value = excluded.value,
-                        updated_at = excluded.updated_at
-                    """,
-                    ("vibration_intensity", str(value), _utc_now_iso()),
-                )
-                conn.commit()
+        self._save_value("vibration_intensity", value)
 
 
 def _load_dotenv(path: str = ENV_FILE) -> None:
@@ -226,6 +210,18 @@ def _get_bhaptics_credentials() -> tuple[str, str, str]:
     return app_id, api_key, app_name
 
 
+def _get_default_subscriber_id() -> int:
+    _load_dotenv()
+    raw = os.getenv(ENV_SUBSCRIBER_ID, str(SUBSCRIBER_ID)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return SUBSCRIBER_ID
+    if value <= 0:
+        return SUBSCRIBER_ID
+    return value
+
+
 def _parse_broker(value: str, fallback_port: int) -> tuple[str, int]:
     raw = value.strip()
     if not raw:
@@ -261,6 +257,36 @@ def _parse_run_payload(payload: str) -> tuple[str, int | None]:
             f"invalid start timestamp (expected epoch-ms): {publish_ms}"
         )
     return "start", publish_ms
+
+
+def _set_process_priority_above_normal() -> None:
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+        process_handle = ctypes.windll.kernel32.GetCurrentProcess()
+        if process_handle == 0:
+            print("warning: failed to get current process handle for priority change")
+            return
+
+        ok = ctypes.windll.kernel32.SetPriorityClass(
+            process_handle,
+            ABOVE_NORMAL_PRIORITY_CLASS,
+        )
+        if ok == 0:
+            error_code = ctypes.windll.kernel32.GetLastError()
+            print(
+                "warning: failed to set process priority to ABOVE_NORMAL "
+                f"(error={error_code})"
+            )
+            return
+
+        print("set process priority to ABOVE_NORMAL")
+    except Exception as exc:
+        print(f"warning: failed to set process priority: {exc}")
 
 
 class HapticsController:
@@ -300,6 +326,7 @@ class HapticsController:
         self.initialized = False
         self.play_task: asyncio.Task[None] | None = None
         self.scheduled_start_task: asyncio.Task[None] | None = None
+        self.play_dot_tasks: set[asyncio.Task[None]] = set()
         self.current_schedule_id = 0
 
         self.thread.start()
@@ -349,6 +376,13 @@ class HapticsController:
         effective_shift = self._get_effective_phase_shift_ms()
         return payload_target_ms - effective_shift
 
+    @staticmethod
+    def _sample_wall_and_perf() -> tuple[float, float]:
+        # Sample the two clocks back-to-back to minimize translation skew.
+        wall_s = time.time()
+        perf_s = time.perf_counter()
+        return wall_s, perf_s
+
     def _commit_session_phase_shift(self) -> None:
         with self._status_lock:
             delta_ms = self.session_phase_shift_delta_ms
@@ -367,6 +401,25 @@ class HapticsController:
         )
         self._set_last_event(f"committed phase_shift_ms={committed_phase}")
 
+    def _set_stopped_state(self, last_event: str | None = None) -> None:
+        self.current_run = 0
+        self.current_schedule_id += 1
+        self._set_run_state("stopped")
+        if last_event is not None:
+            self._set_last_event(last_event)
+
+    async def _cancel_task(self, task: asyncio.Task[None] | None) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _cancel_runtime_tasks(self) -> None:
+        await self._cancel_scheduled_start_task()
+        await self._cancel_play_task()
+        await self._cancel_play_dot_tasks()
+
     async def _initialize(self) -> None:
         if self.initialized:
             return
@@ -379,12 +432,8 @@ class HapticsController:
         self.initialized = True
 
     async def _recover_and_initialize_async(self) -> bool:
-        self.current_run = 0
-        self.current_schedule_id += 1
-        self._set_run_state("stopped")
-        self._set_last_event("recovering haptics initialization")
-        await self._cancel_scheduled_start_task()
-        await self._cancel_play_task()
+        self._set_stopped_state(last_event="recovering haptics initialization")
+        await self._cancel_runtime_tasks()
         if self.initialized:
             with contextlib.suppress(Exception):
                 await bhaptics_python.stop_all()
@@ -399,68 +448,135 @@ class HapticsController:
         print("recovered initialization; start request was rejected")
         return True
 
-    async def _play_loop(self, first_tick: float | None = None) -> None:
+    async def _play_loop(
+        self,
+        first_tick: float | None = None,
+        first_wall_s: float | None = None,
+    ) -> None:
+        sampled_wall_s, sampled_perf_s = self._sample_wall_and_perf()
         if first_tick is None:
-            next_tick = time.perf_counter()
+            anchor_tick = sampled_perf_s
         else:
-            next_tick = first_tick
+            anchor_tick = first_tick
+
+        if first_wall_s is None:
+            anchor_wall_s = sampled_wall_s + (anchor_tick - sampled_perf_s)
+        else:
+            anchor_wall_s = first_wall_s
+
+        beat_interval = 60.0 / self.current_bpm
+        beat_index = 0
+
+        # Keep beat targets on a fixed origin to prevent floating accumulation.
         while True:
             shift_ms = self._consume_pending_phase_shift_ms()
             if shift_ms != 0:
-                next_tick -= shift_ms / 1000.0
+                shift_s = shift_ms / 1000.0
+                anchor_tick -= shift_s
+                anchor_wall_s -= shift_s
                 print(f"applied pending phase shift shift_ms={shift_ms}")
                 self._set_last_event(f"applied pending phase shift shift_ms={shift_ms}")
 
-            await self._wait_until_tick(next_tick)
+            target_tick = anchor_tick + (beat_index * beat_interval)
+            await self._wait_until_tick(target_tick)
 
-            bpm = self.current_bpm
             with self._status_lock:
                 intensity = self.vibration_intensity
-            beat_interval = 60.0 / bpm
-            values = [intensity] * MOTOR_LEN
-            await bhaptics_python.play_dot(0, 100, values, -1)
+            # Timing loop should not block on external I/O.
+            self._schedule_play_dot(intensity)
 
-            next_tick += beat_interval
-            now = time.perf_counter()
-            if next_tick <= now:
-                skipped = int((now - next_tick) // beat_interval) + 1
-                next_tick += skipped * beat_interval
+            wall_now_s, perf_now_s = self._sample_wall_and_perf()
+            expected_wall_from_perf_s = perf_now_s + (anchor_wall_s - anchor_tick)
+            clock_drift_s = wall_now_s - expected_wall_from_perf_s
+            if abs(clock_drift_s) > CLOCK_DRIFT_REANCHOR_THRESHOLD_S:
+                # perf_counter and wall clock can diverge slightly by machine.
+                # Re-anchor both clocks on measurable drift.
+                anchor_tick = perf_now_s - (beat_index * beat_interval)
+                anchor_wall_s = wall_now_s - (beat_index * beat_interval)
+                drift_ms = clock_drift_s * 1000.0
+                print(
+                    "re-anchored wall/perf drift "
+                    f"drift_ms={drift_ms:+.3f} beat_index={beat_index}"
+                )
+                self._set_last_event(
+                    "re-anchored wall/perf drift "
+                    f"drift_ms={drift_ms:+.3f}"
+                )
+
+            beat_index += 1
 
     async def _wait_until_tick(self, target_tick: float) -> None:
         while True:
             remaining = target_tick - time.perf_counter()
             if remaining <= 0:
                 return
-            if remaining > SCHEDULER_COARSE_GUARD_S:
-                await asyncio.sleep(remaining - SCHEDULER_COARSE_GUARD_S)
+            if remaining > SCHEDULER_SPIN_GUARD_S:
+                # Sleep for most of the wait interval, then do a short spin
+                # near the deadline to reduce wakeup jitter.
+                await asyncio.sleep(
+                    max(
+                        0.0,
+                        remaining - max(SCHEDULER_COARSE_GUARD_S, SCHEDULER_SPIN_GUARD_S),
+                    )
+                )
                 continue
-            await asyncio.sleep(0)
+            while time.perf_counter() < target_tick:
+                pass
+            return
+
+    async def _play_dot_async(self, intensity: int) -> None:
+        values = [intensity] * MOTOR_LEN
+        await bhaptics_python.play_dot(0, 100, values, -1)
+
+    def _on_play_dot_task_done(self, task: asyncio.Task[None]) -> None:
+        self.play_dot_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            print(f"play_dot task failed: {exc}")
+            self._set_last_event(f"play_dot task failed: {exc}")
+
+    def _schedule_play_dot(self, intensity: int) -> None:
+        if len(self.play_dot_tasks) >= MAX_PENDING_PLAY_DOT_TASKS:
+            print("dropping tick: play_dot backlog")
+            self._set_last_event("dropping tick: play_dot backlog")
+            return
+        task = self.loop.create_task(self._play_dot_async(intensity))
+        self.play_dot_tasks.add(task)
+        task.add_done_callback(self._on_play_dot_task_done)
+
+    async def _cancel_play_dot_tasks(self) -> None:
+        if not self.play_dot_tasks:
+            return
+        tasks = list(self.play_dot_tasks)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self.play_dot_tasks.clear()
 
     async def _cancel_play_task(self) -> None:
-        if not self.play_task or self.play_task.done():
-            self.play_task = None
-            return
-        self.play_task.cancel()
-        try:
-            await self.play_task
-        except asyncio.CancelledError:
-            pass
+        task = self.play_task
         self.play_task = None
+        await self._cancel_task(task)
 
     async def _cancel_scheduled_start_task(self) -> None:
-        if not self.scheduled_start_task or self.scheduled_start_task.done():
-            self.scheduled_start_task = None
-            return
-        self.scheduled_start_task.cancel()
-        try:
-            await self.scheduled_start_task
-        except asyncio.CancelledError:
-            pass
+        task = self.scheduled_start_task
         self.scheduled_start_task = None
+        await self._cancel_task(task)
 
-    async def _start_play_loop(self, first_tick: float | None = None) -> None:
+    async def _start_play_loop(
+        self,
+        first_tick: float | None = None,
+        first_wall_s: float | None = None,
+    ) -> None:
         if self.play_task is None or self.play_task.done():
-            self.play_task = self.loop.create_task(self._play_loop(first_tick=first_tick))
+            self.play_task = self.loop.create_task(
+                self._play_loop(first_tick=first_tick, first_wall_s=first_wall_s)
+            )
             self._set_run_state("running")
             self._set_last_event("play loop started")
             print("play loop started")
@@ -474,10 +590,11 @@ class HapticsController:
         schedule_id: int,
     ) -> None:
         try:
-            now_ms = int(time.time() * 1000)
-            delay_ms = target_ms - now_ms
-            target_tick = time.perf_counter() + max(0.0, delay_ms / 1000.0)
-            if delay_ms > 0:
+            target_wall_s = target_ms / 1000.0
+            now_wall_s, now_perf_s = self._sample_wall_and_perf()
+            target_tick = now_perf_s + (target_wall_s - now_wall_s)
+            delay_s = target_tick - now_perf_s
+            if delay_s > 0:
                 await self._wait_until_tick(target_tick)
 
             if schedule_id != self.current_schedule_id:
@@ -498,7 +615,7 @@ class HapticsController:
                 "scheduled start reached "
                 f"target_ms={target_ms} actual_ms={actual_ms}"
             )
-            await self._start_play_loop(first_tick=target_tick)
+            await self._start_play_loop(first_tick=target_tick, first_wall_s=target_wall_s)
         except asyncio.CancelledError:
             raise
 
@@ -517,7 +634,7 @@ class HapticsController:
             )
         with self._status_lock:
             self.vibration_intensity = intensity
-        self.config_store.save_vibration_intensity(intensity)
+        await asyncio.to_thread(self.config_store.save_vibration_intensity, intensity)
         self._set_last_event(f"updated vibration_intensity={intensity}")
         print(f"updated vibration_intensity={intensity}")
 
@@ -561,7 +678,7 @@ class HapticsController:
                 self.last_payload_target_ms if scheduled else None
             )
 
-        self.config_store.save_phase_shift_ms(phase_shift_ms)
+        await asyncio.to_thread(self.config_store.save_phase_shift_ms, phase_shift_ms)
         print(f"updated phase_shift_ms={phase_shift_ms}")
         self._set_last_event(f"updated phase_shift_ms={phase_shift_ms}")
 
@@ -581,14 +698,10 @@ class HapticsController:
         await self._set_phase_shift_async(requested)
 
     async def _stop_async(self) -> None:
-        self.current_run = 0
-        self.current_schedule_id += 1
-        self._set_run_state("stopped")
-        self._set_last_event("updated run=0")
+        self._set_stopped_state(last_event="updated run=0")
         print("updated run=0")
 
-        await self._cancel_scheduled_start_task()
-        await self._cancel_play_task()
+        await self._cancel_runtime_tasks()
         if self.initialized:
             await bhaptics_python.stop_all()
             print("play loop stopped")
@@ -597,14 +710,12 @@ class HapticsController:
 
     async def _schedule_start_async(self, payload_target_ms: int) -> bool:
         if not self.initialized:
-            recovered = await self._recover_and_initialize_async()
-            if not recovered:
-                return False
+            await self._recover_and_initialize_async()
             return False
 
         target_ms = self._compute_target_ms(payload_target_ms)
-        now_ms = int(time.time() * 1000)
-        lag_ms = now_ms - target_ms
+        now_wall_s, _ = self._sample_wall_and_perf()
+        lag_ms = int((now_wall_s - (target_ms / 1000.0)) * 1000)
         if lag_ms > 0:
             print(
                 "rejected late start timestamp "
@@ -628,7 +739,7 @@ class HapticsController:
             self._run_scheduled_start(payload_target_ms, target_ms, schedule_id)
         )
 
-        delay_ms = max(0, target_ms - now_ms)
+        delay_ms = max(0, int((target_ms / 1000.0 - now_wall_s) * 1000))
         effective_shift = self._get_effective_phase_shift_ms()
         print(
             "scheduled start "
@@ -643,12 +754,9 @@ class HapticsController:
         return True
 
     async def _close_async(self) -> None:
-        self.current_run = 0
-        self.current_schedule_id += 1
-        self._set_run_state("stopped")
+        self._set_stopped_state()
 
-        await self._cancel_scheduled_start_task()
-        await self._cancel_play_task()
+        await self._cancel_runtime_tasks()
         if self.initialized:
             await bhaptics_python.stop_all()
 
@@ -995,8 +1103,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--subscriber-id",
         type=int,
-        default=SUBSCRIBER_ID,
-        help="Subscriber ID used for ACK topic suffix (default: 1)",
+        default=_get_default_subscriber_id(),
+        help=(
+            "Subscriber ID used for ACK topic suffix "
+            "(default: BHAPTICS_SUBSCRIBER_ID or 1)"
+        ),
     )
     return parser
 
@@ -1006,6 +1117,7 @@ def main() -> int:
     if args.subscriber_id <= 0:
         print("error: --subscriber-id must be a positive integer")
         return 1
+    _set_process_priority_above_normal()
     if bhaptics_python is None:
         print(f"error: missing dependency 'bhaptics_python' ({_BHAPTICS_IMPORT_ERROR})")
         return 1
@@ -1059,15 +1171,26 @@ def main() -> int:
         reason_code: object,
         _properties: mqtt.Properties | None = None,
     ) -> None:
-        is_failure = getattr(reason_code, "is_failure", None)
-        failed = bool(is_failure) if isinstance(is_failure, bool) else False
-        if not failed and reason_code == 0:
-            _client.subscribe([(TOPIC_BPM, config.qos), (TOPIC_RUN, config.qos)])
-            print(f"subscribed to {TOPIC_BPM}, {TOPIC_RUN}")
-            connect_event.set()
-            return
+        def _connect_ok(code: object) -> bool:
+            if code == 0:
+                return True
 
-        if not failed and str(reason_code).strip().lower() in {"success", "0"}:
+            is_failure = getattr(code, "is_failure", None)
+            if isinstance(is_failure, bool):
+                return not is_failure
+            if callable(is_failure):
+                try:
+                    return not bool(is_failure())
+                except TypeError:
+                    pass
+
+            code_value = getattr(code, "value", None)
+            if isinstance(code_value, int):
+                return code_value == 0
+
+            return str(code).strip().lower() in {"success", "0"}
+
+        if _connect_ok(reason_code):
             _client.subscribe([(TOPIC_BPM, config.qos), (TOPIC_RUN, config.qos)])
             print(f"subscribed to {TOPIC_BPM}, {TOPIC_RUN}")
             connect_event.set()

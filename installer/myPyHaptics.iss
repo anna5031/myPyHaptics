@@ -43,6 +43,7 @@ var
   EnvAppId: string;
   EnvApiKey: string;
   EnvAppName: string;
+  EnvSubscriberId: string;
 
 procedure InitializeWizard;
 begin
@@ -57,10 +58,14 @@ begin
   CredentialsPage.Add('BHAPTICS_APP_ID:', False);
   CredentialsPage.Add('BHAPTICS_API_KEY:', True);
   CredentialsPage.Add('BHAPTICS_APP_NAME:', False);
+  CredentialsPage.Add('BHAPTICS_SUBSCRIBER_ID:', False);
   CredentialsPage.Values[2] := 'Hello, bHaptics!';
+  CredentialsPage.Values[3] := '1';
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  ParsedSubscriberId: Integer;
 begin
   Result := True;
   if CurPageID = CredentialsPage.ID then
@@ -68,6 +73,7 @@ begin
     EnvAppId := Trim(CredentialsPage.Values[0]);
     EnvApiKey := Trim(CredentialsPage.Values[1]);
     EnvAppName := Trim(CredentialsPage.Values[2]);
+    EnvSubscriberId := Trim(CredentialsPage.Values[3]);
 
     if EnvAppId = '' then
     begin
@@ -85,6 +91,14 @@ begin
 
     if EnvAppName = '' then
       EnvAppName := 'Hello, bHaptics!';
+
+    ParsedSubscriberId := StrToIntDef(EnvSubscriberId, 0);
+    if ParsedSubscriberId <= 0 then
+    begin
+      MsgBox('BHAPTICS_SUBSCRIBER_ID must be a positive integer.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
   end;
 end;
 
@@ -98,7 +112,8 @@ begin
   EnvBody :=
     'BHAPTICS_APP_ID=' + EnvAppId + #13#10 +
     'BHAPTICS_API_KEY=' + EnvApiKey + #13#10 +
-    'BHAPTICS_APP_NAME=' + EnvAppName + #13#10;
+    'BHAPTICS_APP_NAME=' + EnvAppName + #13#10 +
+    'BHAPTICS_SUBSCRIBER_ID=' + EnvSubscriberId + #13#10;
 
   if not SaveStringToFile(EnvPath, EnvBody, False) then
     MsgBox('Failed to write .env file at:' + #13#10 + EnvPath, mbError, MB_OK);

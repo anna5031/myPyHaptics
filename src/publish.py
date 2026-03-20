@@ -21,9 +21,7 @@ TOPIC_BPM = "bhaptics/bpm"
 TOPIC_RUN = "bhaptics/run"
 ACK_START_ACCEPTED = "0"
 ACK_START_REJECTED_LATE = "-1"
-ACK_TOPIC_PREFIX = "bhaptics/ack"
-ACK_TOPIC_ALL = "bhaptics/#"
-DEFAULT_SUBSCRIBER_ID = 0
+ACK_TOPICS_ALL = ("bhaptics/ack1", "bhaptics/ack2")
 
 
 @dataclass(frozen=True)
@@ -43,15 +41,14 @@ class PublishUI:
         root: tk.Tk,
         client: mqtt.Client,
         config: BrokerConfig,
-        ack_topic_filter: str,
     ) -> None:
         self.root = root
         self.client = client
         self.config = config
-        self.ack_topic_filter = ack_topic_filter
         self.status_var = tk.StringVar(value="ready")
         self.bpm_var = tk.StringVar(value="120")
         self.delay_var = tk.StringVar(value="3")
+        self.run_active = False
         self._build_layout()
 
     def _build_layout(self) -> None:
@@ -84,11 +81,8 @@ class PublishUI:
             command=self._publish_target_start,
         ).grid(row=1, column=2, padx=(10, 0), sticky="w")
 
-        tk.Button(frame, text="Start Now", command=self._start_now).grid(
-            row=2, column=0, pady=(14, 0), sticky="w"
-        )
         tk.Button(frame, text="Stop", command=self._stop).grid(
-            row=2, column=1, pady=(14, 0), sticky="w"
+            row=2, column=0, pady=(14, 0), sticky="w"
         )
 
         tk.Label(frame, text="Status").grid(row=3, column=0, sticky="nw", pady=(14, 0))
@@ -107,13 +101,17 @@ class PublishUI:
 
     def handle_ack(self, topic: str, payload: str) -> None:
         if payload == ACK_START_REJECTED_LATE:
+            self.run_active = False
             self._set_status(f"[{topic}] error: increase start delay")
             return
         if payload == ACK_START_ACCEPTED:
+            self.run_active = True
             self._set_status(f"[{topic}] ack: start accepted")
 
     def _publish_bpm(self) -> None:
         try:
+            if self.run_active:
+                raise ValueError("cannot change BPM while run is active; stop first")
             bpm = int(self.bpm_var.get().strip())
             if bpm <= 0:
                 raise ValueError("bpm must be positive")
@@ -125,25 +123,20 @@ class PublishUI:
                 messagebox.showerror("Publish BPM failed", str(exc))
 
     def _publish_start(self, delay_sec: float) -> None:
-        payload = _resolve_run_payload(run=1, delay_sec=delay_sec)
+        if self.run_active:
+            raise ValueError("run is already active; stop first")
+        payload = _resolve_run_payload(delay_sec=delay_sec)
         _publish_value(self.client, TOPIC_RUN, payload, self.config.qos, self.config.retain)
+        self.run_active = True
         self._set_status(
             f"published {TOPIC_RUN} target_ts_ms={payload} (delay_s={delay_sec:g})"
         )
 
-    def _start_now(self) -> None:
-        try:
-            self._publish_start(delay_sec=0.0)
-        except Exception as exc:
-            self._set_status(f"failed to publish start: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Start failed", str(exc))
-
     def _publish_target_start(self) -> None:
         try:
             delay_sec = float(self.delay_var.get().strip())
-            if delay_sec < 0:
-                raise ValueError("delay must be >= 0")
+            if delay_sec <= 0:
+                raise ValueError("delay must be > 0")
             self._publish_start(delay_sec=delay_sec)
         except Exception as exc:
             self._set_status(f"failed to publish delayed start: {exc}")
@@ -153,6 +146,7 @@ class PublishUI:
     def _stop(self) -> None:
         try:
             _publish_value(self.client, TOPIC_RUN, 0, self.config.qos, self.config.retain)
+            self.run_active = False
             self._set_status(f"published {TOPIC_RUN}=0")
         except Exception as exc:
             self._set_status(f"failed to publish stop: {exc}")
@@ -233,19 +227,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--delay-s",
         type=float,
         default=None,
-        help="Publish start target as floor(current_time)+delay_s seconds",
+        help="Publish start target as floor(current_time)+delay_s seconds (delay_s > 0)",
     )
     parser.add_argument(
         "--run",
         type=int,
         choices=[0, 1],
-        help="Run command (0=stop now, 1=start using target timestamp payload)",
-    )
-    parser.add_argument(
-        "--subscriber-id",
-        type=int,
-        default=DEFAULT_SUBSCRIBER_ID,
-        help="ACK target subscriber ID (0=listen all ACK topics, default: 0)",
+        help="Run command (0=stop, 1=start using --delay-s target timestamp payload)",
     )
     return parser
 
@@ -328,12 +316,8 @@ def _publish_value(
         raise RuntimeError(f"failed to publish {topic}: rc={info.rc}")
 
 
-def _resolve_run_payload(run: int, delay_sec: float | None = None) -> int:
-    if run == 0:
-        return 0
+def _resolve_run_payload(delay_sec: float) -> int:
     now_ms = int(time.time() * 1000)
-    if delay_sec is None:
-        return now_ms
     base_ms = (now_ms // 1000) * 1000
     return base_ms + int(delay_sec * 1000)
 
@@ -350,18 +334,14 @@ def main() -> int:
         parser.error("at least one of --bpm, --run, or --delay-s is required in headless mode")
     if args.bpm is not None and args.bpm <= 0:
         parser.error("--bpm must be a positive integer")
-    if args.delay_s is not None and args.delay_s < 0:
-        parser.error("--delay-s must be >= 0")
+    if args.delay_s is not None and args.delay_s <= 0:
+        parser.error("--delay-s must be > 0")
     if args.delay_s is not None and args.run == 0:
         parser.error("--delay-s cannot be used with --run 0")
-    if args.subscriber_id < 0:
-        parser.error("--subscriber-id must be >= 0")
-
+    if args.run == 1 and args.delay_s is None:
+        parser.error("--delay-s is required with --run 1")
     host, port = _parse_broker(args.broker, args.port)
-    if args.subscriber_id == 0:
-        ack_topic_filter = ACK_TOPIC_ALL
-    else:
-        ack_topic_filter = f"{ACK_TOPIC_PREFIX}{args.subscriber_id}"
+    ack_topics = ACK_TOPICS_ALL
     config = BrokerConfig(
         host=host,
         port=port,
@@ -388,7 +368,6 @@ def main() -> int:
                     root=root,
                     client=client,
                     config=config,
-                    ack_topic_filter=ack_topic_filter,
                 )
 
                 def on_message(
@@ -396,20 +375,23 @@ def main() -> int:
                     _userdata: object,
                     msg: mqtt.MQTTMessage,
                 ) -> None:
-                    if not msg.topic.startswith(ACK_TOPIC_PREFIX):
+                    if msg.topic not in ACK_TOPICS_ALL:
                         return
                     payload = msg.payload.decode("utf-8", errors="ignore").strip()
                     if root.winfo_exists():
                         root.after(0, ui.handle_ack, msg.topic, payload)
 
                 client.on_message = on_message
-                subscribe_result, _mid = client.subscribe([(ack_topic_filter, config.qos)])
+                subscribe_result, _mid = client.subscribe(
+                    [(topic, config.qos) for topic in ack_topics]
+                )
                 if subscribe_result != mqtt.MQTT_ERR_SUCCESS:
                     ui._set_status(
-                        f"failed to subscribe {ack_topic_filter}: rc={subscribe_result}"
+                        "failed to subscribe ACK topics "
+                        f"{', '.join(ack_topics)}: rc={subscribe_result}"
                     )
                 else:
-                    ui._set_status(f"listening for ACK on {ack_topic_filter}")
+                    ui._set_status(f"listening for ACK on {', '.join(ack_topics)}")
                 root.mainloop()
                 return 0
 
@@ -423,12 +405,13 @@ def main() -> int:
             _publish_value(client, TOPIC_RUN, run_payload, config.qos, config.retain)
             print(f"published {TOPIC_RUN}=0")
         elif should_publish_start:
-            run_payload = _resolve_run_payload(1, delay_sec=args.delay_s)
+            if args.delay_s is None:
+                raise ValueError("delay_s is required for start")
+            run_payload = _resolve_run_payload(delay_sec=args.delay_s)
             _publish_value(client, TOPIC_RUN, run_payload, config.qos, config.retain)
-            delay_text = 0.0 if args.delay_s is None else args.delay_s
             print(
                 f"published {TOPIC_RUN} target_ts_ms={run_payload} "
-                f"(delay_s={delay_text:g})"
+                f"(delay_s={args.delay_s:g})"
             )
 
         return 0

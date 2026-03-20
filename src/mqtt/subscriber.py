@@ -13,6 +13,7 @@ class MQTTSubscriber:
         self._address = address
         self._port = port
         self._handlers: dict[str, list[Handler]] = defaultdict(list)
+        self._client: aiomqtt.Client | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -22,24 +23,28 @@ class MQTTSubscriber:
         """Register a topic with an async handler."""
         self._handlers[topic].append(handler)
 
-    async def run(self):
-        """Connect and listen for messages. Run this in your async main."""
-        async with aiomqtt.Client(self._address, self._port) as client:
-            for topic in self._handlers:
-                await client.subscribe(topic)
-                print(f"[MQTT] Subscribed → {topic}")
-            print(f"[MQTT] Connected to {self._address}:{self._port}")
+    async def connect(self):
+        """Connect to the broker and subscribe to all registered topics."""
+        self._client = aiomqtt.Client(self._address, self._port)
+        await self._client.__aenter__()
+        for topic in self._handlers:
+            await self._client.subscribe(topic)
+            print(f"[MQTT] Subscribed → {topic}")
+        print(f"[MQTT] Connected to {self._address}:{self._port}")
 
-            async for message in client.messages:
-                topic = str(message.topic)
-                payload = message.payload.decode("utf-8", errors="replace")
-                print(f"[MQTT] {topic}: {payload}")
-                await self._dispatch(topic, payload)
+    async def disconnect(self):
+        """Disconnect from the broker."""
+        if self._client is not None:
+            await self._client.__aexit__(None, None, None)
+            self._client = None
+            print("[MQTT] Disconnected")
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    async def _dispatch(self, topic: str, payload: str):
-        handlers = self._handlers.get(topic, [])
-        await asyncio.gather(*(h(payload) for h in handlers))
+    async def listen(self):
+        """Listen for messages indefinitely. Call connect() first."""
+        assert self._client is not None, "Call connect() before listen()"
+        async for message in self._client.messages:
+            topic = str(message.topic)
+            payload = message.payload.decode("utf-8", errors="replace")
+            print(f"[MQTT] {topic}: {payload}")
+            handlers = self._handlers.get(topic, [])
+            await asyncio.gather(*(h(payload) for h in handlers))

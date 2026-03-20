@@ -9,8 +9,12 @@ async def main():
     sub = MQTTSubscriber()
     handler = CommandHandler()
     sub.subscribe(topic.COMMAND, handler.handle)
-
-    await sub.run()
+    
+    try:
+        await sub.connect()
+        await sub.listen()
+    finally:
+        await sub.disconnect()
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from typing import Callable, Coroutine, Any
 import aiomqtt
 import config
 
-Handler = Callable[[str, str], Coroutine[Any, Any, None]]
+Handler = Callable[[str], Coroutine[Any, Any, None]]
 
 
 class MQTTSubscriber:
@@ -18,12 +18,9 @@ class MQTTSubscriber:
     # Public API
     # ------------------------------------------------------------------
 
-    def subscribe(self, topic: str, handler: Handler | None = None):
-        """Register a topic and an optional async handler."""
-        if handler is not None:
-            self._handlers[topic].append(handler)
-        elif topic not in self._handlers:
-            self._handlers[topic] = []
+    def subscribe(self, topic: str, handler: Handler):
+        """Register a topic with an async handler."""
+        self._handlers[topic].append(handler)
 
     async def run(self):
         """Connect and listen for messages. Run this in your async main."""
@@ -45,4 +42,4 @@ class MQTTSubscriber:
 
     async def _dispatch(self, topic: str, payload: str):
         handlers = self._handlers.get(topic, [])
-        await asyncio.gather(*(h(topic, payload) for h in handlers))
+        await asyncio.gather(*(h(payload) for h in handlers))

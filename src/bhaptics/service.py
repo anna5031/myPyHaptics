@@ -11,7 +11,7 @@ class BHapticsService:
         await self.bridge.play_loop(100, bpm)
 
     async def stop_metronome(self):
-        
+        await self.bridge.stop_metronome()
 
 async def main():
     bridge = BHapticsBridge()
@@ -23,5 +23,7 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+        while True:
+            print("DOne!!")
     except KeyboardInterrupt:
         print("Metronome stopped.")

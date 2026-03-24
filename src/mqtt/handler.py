@@ -1,7 +1,8 @@
 import json
+from datetime import datetime
 
 from mqtt.message import StartMessage, StopMessage
-from scheduler.scheduler import Scheduler
+from utils.scheduler import Scheduler
 
 
 class CommandHandler:
@@ -23,8 +24,11 @@ class CommandHandler:
         def callback():
             print(f"[CommandHandler] Executed scheduled start for bpm={msg.bpm} at time={msg.time}!")
 
+        # Convert the float timestamp back to a datetime to satisfy the new typed signature
+        target_dt = datetime.fromtimestamp(msg.time)
+
         self.scheduler.schedule(
-            msg.time,
+            target_dt,
             callback
         )
 

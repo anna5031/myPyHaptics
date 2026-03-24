@@ -1,7 +1,8 @@
 import asyncio
 import time
+from datetime import datetime
 import pytest
-from src.scheduler.scheduler import Scheduler
+from utils.scheduler import Scheduler
 
 @pytest.mark.asyncio
 async def test_scheduler_delays():
@@ -23,9 +24,10 @@ async def test_scheduler_delays():
     
     print("\n[Scheduler Test] Scheduling tests at exactly T=0...")
     for d in delays:
-        target = start_time + d
-        print(f"[Scheduler Test] Scheduling {d}s execution for {target:.3f}")
-        scheduler.schedule(target, make_callback(d))
+        target_timestamp = start_time + d
+        target_dt = datetime.fromtimestamp(target_timestamp)
+        print(f"[Scheduler Test] Scheduling {d}s execution for {target_timestamp:.3f}")
+        scheduler.schedule(target_dt, make_callback(d))
 
     # Wait for the longest task (30s) plus a tiny 1-second buffer for the loop to formally spin back around
     print(f"[Scheduler Test] Entering 31-second await to capture the 30s task...")

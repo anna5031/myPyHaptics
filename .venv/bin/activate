@@ -14,6 +14,14 @@ deactivate () {
         unset _OLD_VIRTUAL_PYTHONHOME
     fi
 
+    if [ -n "${_OLD_VIRTUAL_PYTHONPATH:-}" ] ; then
+        PYTHONPATH="${_OLD_VIRTUAL_PYTHONPATH:-}"
+        export PYTHONPATH
+        unset _OLD_VIRTUAL_PYTHONPATH
+    else
+        unset PYTHONPATH
+    fi
+
     # Call hash to forget past commands. Without forgetting
     # past commands the $PATH changes we made may not be respected
     hash -r 2> /dev/null
@@ -56,6 +64,12 @@ if [ -n "${PYTHONHOME:-}" ] ; then
     _OLD_VIRTUAL_PYTHONHOME="${PYTHONHOME:-}"
     unset PYTHONHOME
 fi
+
+if [ -n "${PYTHONPATH:-}" ] ; then
+    _OLD_VIRTUAL_PYTHONPATH="${PYTHONPATH:-}"
+fi
+PYTHONPATH="/home/cotidie/repositories/kaist/myPyHaptics/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
 
 if [ -z "${VIRTUAL_ENV_DISABLE_PROMPT:-}" ] ; then
     _OLD_VIRTUAL_PS1="${PS1:-}"

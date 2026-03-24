@@ -1,4 +1,4 @@
-from bridge import BHapticsBridge
+from .bridge import BHapticsBridge
 import asyncio
 
 is_running = False

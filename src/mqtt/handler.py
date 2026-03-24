@@ -3,13 +3,15 @@ from datetime import datetime
 
 from mqtt.message import StartMessage, StopMessage
 from utils.scheduler import Scheduler
+from bhaptics.service import BHapticsService
 
 
 class CommandHandler:
     TOPIC = "bHaptics/command"
 
-    def __init__(self):
+    def __init__(self, haptics_service: BHapticsService):
         self.scheduler = Scheduler()
+        self.haptics = haptics_service
 
     async def handle(self, payload: str):
         command = json.loads(payload).get("command")
@@ -21,8 +23,9 @@ class CommandHandler:
             print(f"[CommandHandler] Unknown command: {command!r}")
 
     async def _on_start(self, msg: StartMessage):
-        def callback():
+        async def callback():
             print(f"[CommandHandler] Executed scheduled start for bpm={msg.bpm} at time={msg.time}!")
+            await self.haptics.start_metronome(msg.bpm)
 
         # Convert the float timestamp back to a datetime to satisfy the new typed signature
         target_dt = datetime.fromtimestamp(msg.time)
@@ -34,3 +37,4 @@ class CommandHandler:
 
     async def _on_stop(self, msg: StopMessage):
         print("[CommandHandler] Stop")
+        await self.haptics.stop_metronome()

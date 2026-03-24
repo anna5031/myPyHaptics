@@ -1,4 +1,5 @@
 import asyncio
+<<<<<<< Updated upstream
 import threading
 import time
 
@@ -38,3 +39,33 @@ class Scheduler:
         # If the callback generated a coroutine, eagerly schedule it as a Task
         if asyncio.iscoroutine(res):
             self._loop.create_task(res)
+=======
+from datetime import datetime, timezone
+from typing import Callable, Awaitable
+
+Callback = Callable[[], Awaitable[None]]
+
+class Scheduler:
+    def __init__(self):
+        self._tasks: list[asyncio.Task] = []
+
+    async def schedule(self, at: datetime, callback: Callback) -> asyncio.Task:
+        """Schedule an async callback to run at a specific UTC time."""
+        delay = (at - datetime.now(timezone.utc)).total_seconds()
+        if delay < 0:
+            raise ValueError(f"Scheduled time {at.isoformat()} is in the past")
+
+        task = asyncio.create_task(self._wait_and_run(delay, callback))
+        self._tasks.append(task)
+        return task
+
+    def cancel_all(self):
+        """Cancel all pending scheduled tasks."""
+        for task in self._tasks:
+            task.cancel()
+        self._tasks.clear()
+
+    async def _wait_and_run(self, delay: float, callback: Callback):
+        await asyncio.sleep(delay)
+        await callback()
+>>>>>>> Stashed changes

@@ -25,7 +25,7 @@ class BHapticsBridge:
         
         # event_name, intensity, duration_multiplier, x_offset, y_offset, interval(ms), max_count
         # duration multiplier set to 1.0 to prevent the metronome beat from stretching and overlapping
-        await bhaptics_python.play_loop("bass", intensity, 0.1, 0, 0, interval, 100000000)
+        await bhaptics_python.play_loop("bass", intensity, 1, 0, 0, interval, 100000000)
         # await asyncio.sleep(10000)  # Keep the loop running for a while to demonstrate the metronome
     
     async def stop_metronome(self):

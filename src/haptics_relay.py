@@ -445,9 +445,11 @@ class HapticsController:
                 intensity = self.vibration_intensity
             beat_interval = 60.0 / bpm
             values = [intensity] * MOTOR_LEN
-            beat_time_ms = int(time.time() * 1000)
+            beat_before_ms = int(time.time() * 1000)
             await bhaptics_python.play_dot(0, 100, values, -1)
-            print(f"played haptic feedback at epoch_ms={beat_time_ms}")
+            beat_after_ms = int(time.time() * 1000)
+            play_dot_duration_ms = beat_after_ms - beat_before_ms
+            print(f"played haptic feedback at epoch_ms={beat_before_ms} (duration={play_dot_duration_ms}ms)")
 
             next_tick += beat_interval
             now = time.perf_counter()

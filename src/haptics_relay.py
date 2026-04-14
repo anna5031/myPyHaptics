@@ -431,6 +431,8 @@ class HapticsController:
 
     async def _play_loop(self) -> None:
         next_tick = time.perf_counter()
+        play_loop_start_ms = int(time.time() * 1000)
+        print(f"play loop started at epoch_ms={play_loop_start_ms}")
         while True:
             shift_ms = self._consume_pending_phase_shift_ms()
             if shift_ms != 0:
@@ -443,8 +445,9 @@ class HapticsController:
                 intensity = self.vibration_intensity
             beat_interval = 60.0 / bpm
             values = [intensity] * MOTOR_LEN
+            beat_time_ms = int(time.time() * 1000)
             await bhaptics_python.play_dot(0, 100, values, -1)
-            print("played haptic feedback")
+            print(f"played haptic feedback at epoch_ms={beat_time_ms}")
 
             next_tick += beat_interval
             now = time.perf_counter()

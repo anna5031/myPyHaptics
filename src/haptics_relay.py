@@ -40,6 +40,12 @@ ENV_FILE = ".env"
 ENV_APP_ID = "BHAPTICS_APP_ID"
 ENV_API_KEY = "BHAPTICS_API_KEY"
 ENV_APP_NAME = "BHAPTICS_APP_NAME"
+ENV_MQTT_BROKER = "MQTT_BROKER"
+ENV_MQTT_PORT = "MQTT_PORT"
+ENV_MQTT_KEEPALIVE = "MQTT_KEEPALIVE"
+ENV_MQTT_QOS = "MQTT_QOS"
+ENV_MQTT_USERNAME = "MQTT_USERNAME"
+ENV_MQTT_PASSWORD = "MQTT_PASSWORD"
 DEFAULT_APP_NAME = "Hello, bHaptics!"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MOTOR_LEN = 32
@@ -225,6 +231,41 @@ def _get_bhaptics_credentials() -> tuple[str, str, str]:
     return app_id, api_key, app_name
 
 
+def _get_env_int(name: str, default: int, minimum: int | None = None) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    return value
+
+
+def _get_mqtt_defaults() -> dict[str, str | int | None]:
+    _load_dotenv()
+    broker = os.getenv(ENV_MQTT_BROKER, "mqtt-web.makinteract.com").strip() or "mqtt-web.makinteract.com"
+    port = _get_env_int(ENV_MQTT_PORT, 1883, minimum=1)
+    keepalive = _get_env_int(ENV_MQTT_KEEPALIVE, 60, minimum=1)
+    qos = _get_env_int(ENV_MQTT_QOS, 1, minimum=0)
+    if qos not in {0, 1, 2}:
+        qos = 1
+
+    username = os.getenv(ENV_MQTT_USERNAME, "").strip() or None
+    password = os.getenv(ENV_MQTT_PASSWORD, "").strip() or None
+
+    return {
+        "broker": broker,
+        "port": port,
+        "keepalive": keepalive,
+        "qos": qos,
+        "username": username,
+        "password": password,
+    }
+
+
 def _parse_broker(value: str, fallback_port: int) -> tuple[str, int]:
     raw = value.strip()
     if not raw:
@@ -282,6 +323,7 @@ class HapticsController:
         self.current_bpm = DEFAULT_BPM
         self.current_run = 0
         self.current_run_state = "stopped"
+        self.player_status = "not initialized"
         loaded_intensity = self.config_store.load_vibration_intensity(
             default=DEFAULT_VIBRATION_INTENSITY
         )
@@ -322,6 +364,10 @@ class HapticsController:
     def _set_last_event(self, message: str) -> None:
         with self._status_lock:
             self.last_event = message
+
+    def _set_player_status(self, status: str) -> None:
+        with self._status_lock:
+            self.player_status = status
 
     def _set_schedule_times(
         self,
@@ -369,13 +415,19 @@ class HapticsController:
     async def _initialize(self) -> None:
         if self.initialized:
             return
-        result = await bhaptics_python.registry_and_initialize(
-            self.app_id,
-            self.api_key,
-            self.app_name,
-        )
+        self._set_player_status("connecting...")
+        try:
+            result = await bhaptics_python.registry_and_initialize(
+                self.app_id,
+                self.api_key,
+                self.app_name,
+            )
+        except Exception:
+            self._set_player_status("connection failed")
+            raise
         print(f"bHaptics initialization result: {result}")
         self.initialized = True
+        self._set_player_status("connected")
 
     async def _play_loop(self) -> None:
         next_tick = time.perf_counter()
@@ -610,6 +662,7 @@ class HapticsController:
         if self.initialized:
             await bhaptics_python.close()
             self.initialized = False
+            self._set_player_status("disconnected")
 
     def set_bpm(self, bpm: int, timeout: float = 5.0) -> None:
         future = asyncio.run_coroutine_threadsafe(self._set_bpm_async(bpm), self.loop)
@@ -640,12 +693,17 @@ class HapticsController:
         )
         future.result(timeout=timeout)
 
+    def initialize(self, timeout: float = 5.0) -> None:
+        future = asyncio.run_coroutine_threadsafe(self._initialize(), self.loop)
+        future.result(timeout=timeout)
+
     def get_status_snapshot(self) -> dict[str, int | str | None]:
         with self._status_lock:
             effective_phase_shift = self.phase_shift_ms + self.session_phase_shift_delta_ms
             return {
                 "current_bpm": self.current_bpm,
                 "run_state": self.current_run_state,
+                "bhaptics_status": self.player_status,
                 "vibration_intensity": self.vibration_intensity,
                 "phase_shift_ms": self.phase_shift_ms,
                 "pending_phase_shift_ms": self.pending_phase_shift_ms,
@@ -681,140 +739,104 @@ class SubscriberControlUI:
         self.controller = controller
         self.request_stop = request_stop
 
+        self.mqtt_status_var = tk.StringVar(value="connecting...")
+        self.player_status_var = tk.StringVar(value="not initialized")
         self.bpm_var = tk.StringVar(value="-")
         self.run_state_var = tk.StringVar(value="-")
         self.vibration_intensity_var = tk.StringVar(value="-")
-        self.vibration_intensity_entry_var = tk.StringVar(
-            value=str(DEFAULT_VIBRATION_INTENSITY)
-        )
-        self.phase_shift_entry_var = tk.StringVar(value="0")
-        self.applied_phase_shift_var = tk.StringVar(value="-")
-        self.pending_phase_shift_var = tk.StringVar(value="-")
-        self.target_var = tk.StringVar(value="-")
-        self.actual_var = tk.StringVar(value="-")
+        self.phase_shift_var = tk.StringVar(value="-")
         self.offset_var = tk.StringVar(value="-")
-        self.last_event_var = tk.StringVar(value="-")
         self.apply_status_var = tk.StringVar(value="")
-        self.vibration_intensity_entry_dirty = False
-        self.phase_entry_dirty = False
 
         self._build_layout()
         self._refresh()
 
     def _build_layout(self) -> None:
         self.root.title("bHaptics Relay Controller")
-        self.root.geometry("640x390")
+        self.root.geometry("640x320")
         self.root.resizable(False, False)
+
+        label_font = ("Helvetica", 12)
+        value_font = ("Helvetica", 10)
+        button_font = ("Helvetica", 11, "bold")
+        status_font = ("Helvetica", 10)
 
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(frame, text="Current BPM").grid(row=0, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.bpm_var).grid(row=0, column=1, sticky="w")
+        tk.Label(frame, text="MQTT", font=label_font).grid(row=0, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.mqtt_status_var, font=value_font).grid(row=0, column=1, sticky="w")
 
-        tk.Label(frame, text="Run State").grid(row=1, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.run_state_var).grid(row=1, column=1, sticky="w")
+        tk.Label(frame, text="bHaptics", font=label_font).grid(row=1, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.player_status_var, font=value_font).grid(
+            row=1, column=1, sticky="w"
+        )
 
-        tk.Label(frame, text="Vibration Intensity").grid(row=2, column=0, sticky="w")
+        tk.Label(frame, text="Current BPM", font=label_font).grid(row=2, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.bpm_var, font=value_font).grid(row=2, column=1, sticky="w")
+
+        tk.Label(frame, text="Run State", font=label_font).grid(row=3, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.run_state_var, font=value_font).grid(row=3, column=1, sticky="w")
+
+        tk.Label(frame, text="Vibration Intensity", font=label_font).grid(row=4, column=0, sticky="w")
         intensity_controls = tk.Frame(frame)
-        intensity_controls.grid(row=2, column=1, sticky="w")
+        intensity_controls.grid(row=4, column=1, sticky="w")
+
+        tk.Label(
+            intensity_controls,
+            textvariable=self.vibration_intensity_var,
+            font=value_font,
+            width=4,
+            anchor="e",
+        ).pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Button(
             intensity_controls,
             text="-",
             width=3,
+            font=button_font,
             command=lambda: self._step_vibration_intensity(-VIBRATION_INTENSITY_STEP),
         ).pack(side=tk.LEFT)
-        intensity_entry = tk.Entry(
-            intensity_controls,
-            textvariable=self.vibration_intensity_entry_var,
-            width=10,
-            justify="right",
-        )
-        self.vibration_intensity_entry = intensity_entry
-        intensity_entry.pack(side=tk.LEFT, padx=6)
-        intensity_entry.bind("<Return>", lambda _event: self._apply_vibration_intensity())
-        intensity_entry.bind(
-            "<KeyRelease>",
-            lambda _event: self._mark_vibration_intensity_entry_dirty(),
-        )
         tk.Button(
             intensity_controls,
             text="+",
             width=3,
+            font=button_font,
             command=lambda: self._step_vibration_intensity(VIBRATION_INTENSITY_STEP),
-        ).pack(side=tk.LEFT)
-        tk.Button(
-            intensity_controls,
-            text="Apply",
-            width=8,
-            command=self._apply_vibration_intensity,
         ).pack(side=tk.LEFT, padx=(8, 0))
 
-        tk.Label(frame, text="Applied Intensity").grid(row=3, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.vibration_intensity_var).grid(
-            row=3, column=1, sticky="w"
-        )
-
-        tk.Label(frame, text="Phase Shift (ms)").grid(row=4, column=0, sticky="w")
+        tk.Label(frame, text="Phase Shift (ms)", font=label_font).grid(row=5, column=0, sticky="w")
         controls = tk.Frame(frame)
-        controls.grid(row=4, column=1, sticky="w")
+        controls.grid(row=5, column=1, sticky="w")
+
+        tk.Label(
+            controls,
+            textvariable=self.phase_shift_var,
+            font=value_font,
+            width=6,
+            anchor="e",
+        ).pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Button(
             controls,
-            text="-",
-            width=3,
+            text="Slower",
+            width=8,
+            font=button_font,
             command=lambda: self._step_phase_shift(-PHASE_SHIFT_STEP_MS),
         ).pack(side=tk.LEFT)
-        phase_entry = tk.Entry(
-            controls,
-            textvariable=self.phase_shift_entry_var,
-            width=10,
-            justify="right",
-        )
-        self.phase_entry = phase_entry
-        phase_entry.pack(side=tk.LEFT, padx=6)
-        phase_entry.bind("<Return>", lambda _event: self._apply_phase_shift())
-        phase_entry.bind("<KeyRelease>", lambda _event: self._mark_phase_entry_dirty())
         tk.Button(
             controls,
-            text="+",
-            width=3,
-            command=lambda: self._step_phase_shift(PHASE_SHIFT_STEP_MS),
-        ).pack(side=tk.LEFT)
-        tk.Button(
-            controls,
-            text="Apply",
+            text="Faster",
             width=8,
-            command=self._apply_phase_shift,
+            font=button_font,
+            command=lambda: self._step_phase_shift(PHASE_SHIFT_STEP_MS),
         ).pack(side=tk.LEFT, padx=(8, 0))
 
-        tk.Label(frame, text="Applied Phase Shift").grid(row=5, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.applied_phase_shift_var).grid(
-            row=5, column=1, sticky="w"
-        )
+        tk.Label(frame, text="actual-target (ms)", font=label_font).grid(row=6, column=0, sticky="w")
+        tk.Label(frame, textvariable=self.offset_var, font=value_font).grid(row=6, column=1, sticky="w")
 
-        tk.Label(frame, text="Pending Phase Shift").grid(row=6, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.pending_phase_shift_var).grid(
-            row=6, column=1, sticky="w"
-        )
-
-        tk.Label(frame, text="Last target_ms").grid(row=7, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.target_var).grid(row=7, column=1, sticky="w")
-
-        tk.Label(frame, text="Last actual_ms").grid(row=8, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.actual_var).grid(row=8, column=1, sticky="w")
-
-        tk.Label(frame, text="actual-target (ms)").grid(row=9, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.offset_var).grid(row=9, column=1, sticky="w")
-
-        tk.Label(frame, text="Last Event").grid(row=10, column=0, sticky="w")
-        tk.Label(frame, textvariable=self.last_event_var, anchor="w").grid(
-            row=10, column=1, sticky="w"
-        )
-
-        tk.Label(frame, textvariable=self.apply_status_var, fg="#1a5f7a").grid(
-            row=11, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        tk.Label(frame, textvariable=self.apply_status_var, fg="#1a5f7a", font=status_font).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -826,38 +848,13 @@ class SubscriberControlUI:
             return VIBRATION_INTENSITY_MAX
         return value
 
-    def _parse_vibration_intensity_entry(self) -> int:
-        raw = self.vibration_intensity_entry_var.get().strip()
-        if not raw:
-            raise ValueError("vibration intensity is empty")
-        return int(raw)
-
     def _step_vibration_intensity(self, step: int) -> None:
         try:
-            current = self._parse_vibration_intensity_entry()
-        except ValueError:
             snapshot = self.controller.get_status_snapshot()
             current = int(snapshot["vibration_intensity"] or DEFAULT_VIBRATION_INTENSITY)
-        updated = self._clamp_vibration_intensity(current + step)
-        self.vibration_intensity_entry_var.set(str(updated))
-        self.vibration_intensity_entry_dirty = True
-
-    def _mark_vibration_intensity_entry_dirty(self) -> None:
-        self.vibration_intensity_entry_dirty = True
-
-    def _apply_vibration_intensity(self) -> None:
-        try:
-            requested = self._clamp_vibration_intensity(
-                self._parse_vibration_intensity_entry()
-            )
+            requested = self._clamp_vibration_intensity(current + step)
             self.controller.set_vibration_intensity(requested)
-            self.vibration_intensity_entry_var.set(str(requested))
             self.apply_status_var.set(f"Applied vibration_intensity={requested}")
-            self.vibration_intensity_entry_dirty = False
-        except ValueError as exc:
-            self.apply_status_var.set(f"Invalid vibration intensity: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Invalid vibration intensity", str(exc))
         except Exception as exc:
             self.apply_status_var.set(f"Failed to apply vibration intensity: {exc}")
             if messagebox is not None:
@@ -870,36 +867,13 @@ class SubscriberControlUI:
             return PHASE_SHIFT_MAX_MS
         return value
 
-    def _parse_phase_shift_entry(self) -> int:
-        raw = self.phase_shift_entry_var.get().strip()
-        if not raw:
-            raise ValueError("phase shift is empty")
-        return int(raw)
-
     def _step_phase_shift(self, step: int) -> None:
         try:
-            current = self._parse_phase_shift_entry()
-        except ValueError:
             snapshot = self.controller.get_status_snapshot()
             current = int(snapshot["effective_phase_shift_ms"] or 0)
-        updated = self._clamp_phase_shift(current + step)
-        self.phase_shift_entry_var.set(str(updated))
-        self.phase_entry_dirty = True
-
-    def _mark_phase_entry_dirty(self) -> None:
-        self.phase_entry_dirty = True
-
-    def _apply_phase_shift(self) -> None:
-        try:
-            requested = self._clamp_phase_shift(self._parse_phase_shift_entry())
+            requested = self._clamp_phase_shift(current + step)
             self.controller.set_phase_shift(requested)
-            self.phase_shift_entry_var.set(str(requested))
             self.apply_status_var.set(f"Applied phase_shift_ms={requested}")
-            self.phase_entry_dirty = False
-        except ValueError as exc:
-            self.apply_status_var.set(f"Invalid phase shift: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Invalid phase shift", str(exc))
         except Exception as exc:
             self.apply_status_var.set(f"Failed to apply phase shift: {exc}")
             if messagebox is not None:
@@ -908,28 +882,23 @@ class SubscriberControlUI:
     def _refresh(self) -> None:
         snapshot = self.controller.get_status_snapshot()
 
+        self.player_status_var.set(str(snapshot.get("bhaptics_status", "-")))
         self.bpm_var.set(str(snapshot["current_bpm"]))
         self.run_state_var.set(str(snapshot["run_state"]))
         self.vibration_intensity_var.set(str(snapshot["vibration_intensity"]))
-        self.applied_phase_shift_var.set(str(snapshot["effective_phase_shift_ms"]))
-        self.pending_phase_shift_var.set(str(snapshot["pending_phase_shift_ms"]))
-        self.last_event_var.set(str(snapshot["last_event"]))
+        self.phase_shift_var.set(str(snapshot["effective_phase_shift_ms"]))
 
         target_ms = snapshot["last_target_ms"]
         actual_ms = snapshot["last_actual_ms"]
-        self.target_var.set("-" if target_ms is None else str(target_ms))
-        self.actual_var.set("-" if actual_ms is None else str(actual_ms))
         if target_ms is None or actual_ms is None:
             self.offset_var.set("-")
         else:
             self.offset_var.set(str(actual_ms - target_ms))
 
-        if not self.phase_entry_dirty:
-            self.phase_shift_entry_var.set(str(snapshot["effective_phase_shift_ms"]))
-        if not self.vibration_intensity_entry_dirty:
-            self.vibration_intensity_entry_var.set(str(snapshot["vibration_intensity"]))
-
         self.root.after(self.REFRESH_MS, self._refresh)
+
+    def set_mqtt_status(self, status: str) -> None:
+        self.mqtt_status_var.set(status)
 
     def _on_close(self) -> None:
         self.request_stop()
@@ -937,35 +906,37 @@ class SubscriberControlUI:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    defaults = _get_mqtt_defaults()
+
     parser = argparse.ArgumentParser(
         description="Subscribe MQTT topics and control bHaptics playback."
     )
     parser.add_argument(
         "--broker",
-        default="mqtt-web.makinteract.com",
-        help="MQTT broker host or URL (default: mqtt-web.makinteract.com)",
+        default=defaults["broker"],
+        help="MQTT broker host or URL",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=1883,
-        help="MQTT broker port (default: 1883)",
+        default=defaults["port"],
+        help="MQTT broker port",
     )
     parser.add_argument(
         "--keepalive",
         type=int,
-        default=60,
-        help="MQTT keepalive in seconds (default: 60)",
+        default=defaults["keepalive"],
+        help="MQTT keepalive in seconds",
     )
     parser.add_argument(
         "--qos",
         type=int,
         choices=[0, 1, 2],
-        default=1,
-        help="MQTT QoS level for subscription (default: 1)",
+        default=defaults["qos"],
+        help="MQTT QoS level for subscription",
     )
-    parser.add_argument("--username", default=None, help="MQTT username")
-    parser.add_argument("--password", default=None, help="MQTT password")
+    parser.add_argument("--username", default=defaults["username"], help="MQTT username")
+    parser.add_argument("--password", default=defaults["password"], help="MQTT password")
     parser.add_argument(
         "--headless",
         action="store_true",
@@ -1005,6 +976,10 @@ def main() -> int:
     stop_event = threading.Event()
     connect_event = threading.Event()
     connect_error: list[str] = []
+    ui: SubscriberControlUI | None = None
+    root = None
+    mqtt_status_lock = threading.Lock()
+    mqtt_status_text = "connecting..."
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     if config.username:
@@ -1019,6 +994,11 @@ def main() -> int:
         except Exception:
             pass
 
+    def _set_ui_mqtt_status(status: str) -> None:
+        nonlocal mqtt_status_text
+        with mqtt_status_lock:
+            mqtt_status_text = status
+
     def on_connect(
         _client: mqtt.Client,
         _userdata: object,
@@ -1031,16 +1011,20 @@ def main() -> int:
         if not failed and reason_code == 0:
             _client.subscribe([(TOPIC_BPM, config.qos), (TOPIC_RUN, config.qos)])
             print(f"subscribed to {TOPIC_BPM}, {TOPIC_RUN}")
+            _set_ui_mqtt_status("connected")
             connect_event.set()
             return
 
         if not failed and str(reason_code).strip().lower() in {"success", "0"}:
             _client.subscribe([(TOPIC_BPM, config.qos), (TOPIC_RUN, config.qos)])
             print(f"subscribed to {TOPIC_BPM}, {TOPIC_RUN}")
+            _set_ui_mqtt_status("connected")
             connect_event.set()
             return
 
-        connect_error.append(f"MQTT connect failed: {reason_code}")
+        error_message = f"MQTT connect failed: {reason_code}"
+        connect_error.append(error_message)
+        _set_ui_mqtt_status(f"connection failed: {reason_code}")
         connect_event.set()
 
     def on_message(
@@ -1083,6 +1067,7 @@ def main() -> int:
         if stop_event.is_set():
             return
         print(f"disconnected from broker: {reason_code}")
+        _set_ui_mqtt_status(f"disconnected: {reason_code}")
 
     client.on_connect = on_connect
     client.on_message = on_message
@@ -1095,6 +1080,17 @@ def main() -> int:
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _stop_handler)
 
+    print("initializing bHaptics player")
+    try:
+        controller.initialize(timeout=5.0)
+    except Exception as exc:
+        print(f"warning: bHaptics initialization failed: {exc}")
+
+    if not args.headless and tk is not None:
+        root = tk.Tk()
+        ui = SubscriberControlUI(root=root, controller=controller, request_stop=_request_stop)
+        ui.set_mqtt_status("connecting...")
+
     try:
         print(f"connecting to MQTT broker {config.host}:{config.port}")
         client.connect(config.host, config.port, config.keepalive)
@@ -1102,10 +1098,13 @@ def main() -> int:
 
         if not connect_event.wait(timeout=5):
             print("error: timeout waiting for MQTT connection")
-            return 1
+            if args.headless or tk is None:
+                return 1
+            _set_ui_mqtt_status("connection failed: timeout")
         if connect_error:
             print(f"error: {connect_error[0]}")
-            return 1
+            if args.headless or tk is None:
+                return 1
 
         print("subscriber running. press Ctrl+C to stop.")
 
@@ -1116,10 +1115,13 @@ def main() -> int:
                 time.sleep(0.2)
             return 0
 
-        root = tk.Tk()
-        SubscriberControlUI(root=root, controller=controller, request_stop=_request_stop)
+        assert root is not None
+        assert ui is not None
 
         def _poll_stop() -> None:
+            with mqtt_status_lock:
+                current_mqtt_status = mqtt_status_text
+            ui.set_mqtt_status(current_mqtt_status)
             if stop_event.is_set():
                 if root.winfo_exists():
                     root.destroy()

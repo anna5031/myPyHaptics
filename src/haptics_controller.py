@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event
-from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
 
@@ -20,6 +21,16 @@ except ModuleNotFoundError:
 TOPIC_BPM = "bhaptics/bpm"
 TOPIC_RUN = "bhaptics/run"
 
+ENV_FILE = ".env"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_MQTT_BROKER = "MQTT_BROKER"
+ENV_MQTT_PORT = "MQTT_PORT"
+ENV_MQTT_KEEPALIVE = "MQTT_KEEPALIVE"
+ENV_MQTT_QOS = "MQTT_QOS"
+ENV_MQTT_RETAIN = "MQTT_RETAIN"
+ENV_MQTT_USERNAME = "MQTT_USERNAME"
+ENV_MQTT_PASSWORD = "MQTT_PASSWORD"
+
 
 @dataclass(frozen=True)
 class BrokerConfig:
@@ -33,10 +44,11 @@ class BrokerConfig:
 
 
 class PublishUI:
-    def __init__(self, root: tk.Tk, client: mqtt.Client, config: BrokerConfig) -> None:
+    def __init__(self, root: tk.Tk, client: mqtt.Client | None, config: BrokerConfig) -> None:
         self.root = root
         self.client = client
         self.config = config
+        self.connection_status_var = tk.StringVar(value="connecting...")
         self.status_var = tk.StringVar(value="ready")
         self.bpm_var = tk.StringVar(value="120")
         self.delay_var = tk.StringVar(value="3")
@@ -44,61 +56,86 @@ class PublishUI:
 
     def _build_layout(self) -> None:
         self.root.title("bHaptcis Controller")
-        self.root.geometry("520x260")
+        self.root.geometry("520x250")
         self.root.resizable(False, False)
+
+        label_font = ("Helvetica", 12)
+        entry_font = ("Helvetica", 12)
+        button_font = ("Helvetica", 11, "bold")
+        status_font = ("Helvetica", 10)
 
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(frame, text="BPM").grid(row=0, column=0, sticky="w")
-        tk.Entry(frame, textvariable=self.bpm_var, width=10, justify="right").grid(
+        tk.Label(frame, text="BPM", font=label_font).grid(row=0, column=0, sticky="w")
+        tk.Entry(frame, textvariable=self.bpm_var, width=10, justify="right", font=entry_font).grid(
             row=0,
             column=1,
             sticky="w",
         )
-        tk.Button(frame, text="Publish BPM", command=self._publish_bpm).grid(
+        tk.Button(frame, text="Set BPM", command=self._publish_bpm, font=button_font).grid(
             row=0, column=2, padx=(10, 0), sticky="w"
         )
 
-        tk.Label(frame, text="Start Delay (sec)").grid(row=1, column=0, sticky="w")
-        tk.Entry(frame, textvariable=self.delay_var, width=10, justify="right").grid(
+        tk.Label(frame, text="Start Delay (sec)", font=label_font).grid(row=1, column=0, sticky="w")
+        tk.Entry(frame, textvariable=self.delay_var, width=10, justify="right", font=entry_font).grid(
             row=1,
             column=1,
             sticky="w",
         )
         tk.Button(
             frame,
-            text="Publish Target Start",
+            text="Start in Delay",
             command=self._publish_target_start,
+            font=button_font,
         ).grid(row=1, column=2, padx=(10, 0), sticky="w")
 
-        tk.Button(frame, text="Start Now", command=self._start_now).grid(
+        tk.Button(frame, text="Stop", command=self._stop, font=button_font).grid(
             row=2, column=0, pady=(14, 0), sticky="w"
         )
-        tk.Button(frame, text="Stop", command=self._stop).grid(
-            row=2, column=1, pady=(14, 0), sticky="w"
-        )
 
-        tk.Label(frame, text="Status").grid(row=3, column=0, sticky="nw", pady=(14, 0))
+        tk.Label(frame, text="MQTT", font=label_font).grid(row=3, column=0, sticky="nw", pady=(14, 0))
+        tk.Label(
+            frame,
+            textvariable=self.connection_status_var,
+            justify="left",
+            anchor="w",
+            font=status_font,
+        ).grid(row=3, column=1, columnspan=2, sticky="w", pady=(14, 0))
+
+        tk.Label(frame, text="Status", font=label_font).grid(row=4, column=0, sticky="nw", pady=(8, 0))
         tk.Label(
             frame,
             textvariable=self.status_var,
             justify="left",
             anchor="w",
             wraplength=380,
-        ).grid(row=3, column=1, columnspan=2, sticky="w", pady=(14, 0))
+            font=status_font,
+        ).grid(row=4, column=1, columnspan=2, sticky="w", pady=(8, 0))
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
 
+    def _set_connection_status(self, message: str) -> None:
+        self.connection_status_var.set(message)
+
+    def set_client(self, client: mqtt.Client | None) -> None:
+        self.client = client
+
+    def _get_client(self) -> mqtt.Client:
+        if self.client is None:
+            raise RuntimeError("MQTT is not connected")
+        return self.client
+
     def _publish_bpm(self) -> None:
         try:
+            client = self._get_client()
             bpm = int(self.bpm_var.get().strip())
             if bpm <= 0:
                 raise ValueError("bpm must be positive")
-            _publish_value(self.client, TOPIC_BPM, bpm, self.config.qos, self.config.retain)
+            _publish_value(client, TOPIC_BPM, bpm, self.config.qos, self.config.retain)
             self._set_status(f"published {TOPIC_BPM}={bpm}")
         except Exception as exc:
             self._set_status(f"failed to publish bpm: {exc}")
@@ -106,19 +143,12 @@ class PublishUI:
                 messagebox.showerror("Publish BPM failed", str(exc))
 
     def _publish_start(self, delay_sec: float) -> None:
+        client = self._get_client()
         payload = _resolve_run_payload(run=1, delay_sec=delay_sec)
-        _publish_value(self.client, TOPIC_RUN, payload, self.config.qos, self.config.retain)
+        _publish_value(client, TOPIC_RUN, payload, self.config.qos, self.config.retain)
         self._set_status(
             f"published {TOPIC_RUN} target_ts_ms={payload} (delay_s={delay_sec:g})"
         )
-
-    def _start_now(self) -> None:
-        try:
-            self._publish_start(delay_sec=0.0)
-        except Exception as exc:
-            self._set_status(f"failed to publish start: {exc}")
-            if messagebox is not None:
-                messagebox.showerror("Start failed", str(exc))
 
     def _publish_target_start(self) -> None:
         try:
@@ -133,7 +163,8 @@ class PublishUI:
 
     def _stop(self) -> None:
         try:
-            _publish_value(self.client, TOPIC_RUN, 0, self.config.qos, self.config.retain)
+            client = self._get_client()
+            _publish_value(client, TOPIC_RUN, 0, self.config.qos, self.config.retain)
             self._set_status(f"published {TOPIC_RUN}=0")
         except Exception as exc:
             self._set_status(f"failed to publish stop: {exc}")
@@ -144,61 +175,87 @@ class PublishUI:
         self.root.destroy()
 
 
-def _parse_broker(value: str, fallback_port: int) -> tuple[str, int]:
-    raw = value.strip()
+def _load_dotenv(path: str = ENV_FILE) -> None:
+    user_path = Path(path)
+    candidates = [user_path]
+    if not user_path.is_absolute():
+        candidates.append(PROJECT_ROOT / user_path)
+
+    lines: list[str] | None = None
+    seen_paths: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        if not candidate.is_file():
+            continue
+        with open(candidate, encoding="utf-8-sig") as file:
+            lines = file.readlines()
+        break
+
+    if lines is None:
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or key in os.environ:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+def _get_env_int(name: str, default: int, minimum: int | None = None) -> int:
+    raw = os.getenv(name, "").strip()
     if not raw:
-        raise ValueError("broker must not be empty")
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    return value
 
-    if "://" in raw:
-        parsed = urlparse(raw)
-        host = parsed.hostname
-        port = parsed.port or fallback_port
-    else:
-        parsed = urlparse(f"mqtt://{raw}")
-        host = parsed.hostname
-        port = parsed.port or fallback_port
 
-    if not host:
-        raise ValueError(f"invalid broker value: {value!r}")
+def _get_mqtt_defaults() -> dict[str, str | int | bool | None]:
+    _load_dotenv()
+    broker = os.getenv(ENV_MQTT_BROKER, "mqtt-web.makinteract.com").strip() or "mqtt-web.makinteract.com"
+    port = _get_env_int(ENV_MQTT_PORT, 1883, minimum=1)
+    keepalive = _get_env_int(ENV_MQTT_KEEPALIVE, 60, minimum=1)
+    qos = _get_env_int(ENV_MQTT_QOS, 1, minimum=0)
+    if qos not in {0, 1, 2}:
+        qos = 1
 
-    return host, port
+    retain_raw = os.getenv(ENV_MQTT_RETAIN, "").strip().lower()
+    retain = retain_raw in {"1", "true", "yes", "on"}
+
+    username = os.getenv(ENV_MQTT_USERNAME, "").strip() or None
+    password = os.getenv(ENV_MQTT_PASSWORD, "").strip() or None
+
+    return {
+        "broker": broker,
+        "port": port,
+        "keepalive": keepalive,
+        "qos": qos,
+        "retain": retain,
+        "username": username,
+        "password": password,
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Publish bHaptics control values to MQTT topics."
     )
-    parser.add_argument(
-        "--broker",
-        default="mqtt-web.makinteract.com",
-        help="MQTT broker host or URL (default: mqtt-web.makinteract.com)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=1883,
-        help="MQTT broker port (default: 1883)",
-    )
-    parser.add_argument(
-        "--keepalive",
-        type=int,
-        default=60,
-        help="MQTT keepalive in seconds (default: 60)",
-    )
-    parser.add_argument(
-        "--qos",
-        type=int,
-        choices=[0, 1, 2],
-        default=1,
-        help="MQTT QoS level (default: 1)",
-    )
-    parser.add_argument(
-        "--retain",
-        action="store_true",
-        help="Publish with retained flag",
-    )
-    parser.add_argument("--username", help="MQTT username", default=None)
-    parser.add_argument("--password", help="MQTT password", default=None)
     parser.add_argument(
         "--ui",
         action="store_true",
@@ -321,28 +378,40 @@ def main() -> int:
     if args.delay_s is not None and args.run == 0:
         parser.error("--delay-s cannot be used with --run 0")
 
-    host, port = _parse_broker(args.broker, args.port)
+    mqtt_defaults = _get_mqtt_defaults()
     config = BrokerConfig(
-        host=host,
-        port=port,
-        keepalive=args.keepalive,
-        qos=args.qos,
-        retain=args.retain,
-        username=args.username,
-        password=args.password,
+        host=mqtt_defaults["broker"],
+        port=mqtt_defaults["port"],
+        keepalive=mqtt_defaults["keepalive"],
+        qos=mqtt_defaults["qos"],
+        retain=mqtt_defaults["retain"],
+        username=mqtt_defaults["username"],
+        password=mqtt_defaults["password"],
     )
 
     client: mqtt.Client | None = None
     try:
-        client = _connect_client(config)
-
         if args.ui:
             if tk is None:
                 raise RuntimeError("tkinter is not available")
             root = tk.Tk()
-            PublishUI(root=root, client=client, config=config)
+            ui = PublishUI(root=root, client=None, config=config)
+            ui._set_connection_status("connecting...")
+            root.update_idletasks()
+            root.update()
+
+            try:
+                client = _connect_client(config)
+                ui.set_client(client)
+                ui._set_connection_status("connected")
+            except Exception as exc:
+                ui._set_connection_status(f"connection failed: {exc}")
+                ui._set_status("MQTT unavailable; controls are disabled")
+
             root.mainloop()
             return 0
+
+        client = _connect_client(config)
 
         if args.bpm is not None:
             _publish_value(client, TOPIC_BPM, args.bpm, config.qos, config.retain)

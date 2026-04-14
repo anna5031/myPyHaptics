@@ -43,7 +43,7 @@ class PublishUI:
         self._build_layout()
 
     def _build_layout(self) -> None:
-        self.root.title("myPyHaptics Publisher")
+        self.root.title("bHaptcis Controller")
         self.root.geometry("520x260")
         self.root.resizable(False, False)
 

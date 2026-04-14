@@ -702,7 +702,7 @@ class SubscriberControlUI:
         self._refresh()
 
     def _build_layout(self) -> None:
-        self.root.title("myPyHaptics Subscriber")
+        self.root.title("bHaptics Relay Controller")
         self.root.geometry("640x390")
         self.root.resizable(False, False)
 

@@ -3,8 +3,8 @@
 ## 1) Purpose
 `myPyHaptics` provides a minimal MQTT-based control flow for bHaptics playback.
 
-- `src/publish.py`: publishes control messages
-- `src/subscribe.py`: subscribes to control messages and controls haptics playback
+- `src/haptics_controller.py`: publishes control messages
+- `src/haptics_relay.py`: subscribes to control messages and controls haptics playback
 
 At this stage, architecture is defined first and implementation follows.
 
@@ -28,13 +28,13 @@ Note: MQTT clients usually connect with `mqtt://`, `tcp://`, or `wss://` endpoin
     - Subscriber starts vibration at payload target time (with optional local `phase_shift_ms` compensation)
 
 ## 4) Component Responsibilities
-### A. Publisher (`src/publish.py`)
+### A. Controller (`src/haptics_controller.py`)
 - Publish BPM to `/bhaptics/bpm`
 - Publish stop (`0`) or start timestamp (`unix_epoch_milliseconds`) to `/bhaptics/run`
 - For delayed start, compute target timestamp on publisher and publish immediately
 - Forward external control input (UI/CLI/test script) to MQTT
 
-### B. Subscriber (`src/subscribe.py`)
+### B. Relay (`src/haptics_relay.py`)
 - Subscribe to `/bhaptics/bpm` and `/bhaptics/run`
 - Keep latest BPM in memory
 - For start timestamp payload, schedule `_play_loop` at payload target time
@@ -42,14 +42,14 @@ Note: MQTT clients usually connect with `mqtt://`, `tcp://`, or `wss://` endpoin
 - Manage both scheduling and playback task lifecycle to prevent duplicates
 
 ## 5) Intended Runtime Sequence
-1. Publisher sends BPM on `/bhaptics/bpm`
-2. Publisher computes `target_ms = floor_to_second(now) + delay_s` and publishes it on `/bhaptics/run`
-3. Subscriber receives target timestamp payload
-4. Subscriber waits until `target_ms`
-5. Subscriber starts `_play_loop` with latest BPM
+1. Controller sends BPM on `/bhaptics/bpm`
+2. Controller computes `target_ms = floor_to_second(now) + delay_s` and publishes it on `/bhaptics/run`
+3. Relay receives target timestamp payload
+4. Relay waits until `target_ms`
+5. Relay starts `_play_loop` with latest BPM
 6. Later BPM updates are reflected on subsequent loop intervals (exact implementation detail to be finalized in code)
 
-## 6) Subscriber State Model
+## 6) Relay State Model
 - `current_bpm: int`
 - `current_run: int` (stop state)
 - `play_task: asyncio.Task | None`
@@ -72,11 +72,11 @@ Core invariants:
 - Define state resynchronization strategy after reconnect (later)
 
 ## 8) Planned Implementation Scope
-- `src/publish.py`
+- `src/haptics_controller.py`
   - MQTT client connect/reconnect
   - Helper functions to publish both topics
   - On delayed start command, publish computed target epoch-ms
-- `src/subscribe.py`
+- `src/haptics_relay.py`
   - Subscription callbacks for both topics
   - Timestamp-based start scheduling from payload target time
   - Reservation task cancellation/replacement on newer start timestamp
@@ -92,5 +92,5 @@ Core invariants:
 
 ## 10) Time Sync Requirement
 - Scheduled simultaneous start depends on aligned system clocks
-- All publisher/subscriber hosts should use NTP synchronization
+- All controller/relay hosts should use NTP synchronization
 - Epoch-ms based scheduling accuracy degrades when host clocks are skewed

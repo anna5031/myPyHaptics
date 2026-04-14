@@ -164,7 +164,7 @@ class CircleOneGui:
         if winsound is None:
             return
         try:
-            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+            winsound.Beep(1200, 30)
         except Exception:
             pass
 

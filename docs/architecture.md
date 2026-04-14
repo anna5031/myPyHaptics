@@ -3,8 +3,8 @@
 ## 1) Purpose
 `myPyHaptics` provides a minimal MQTT-based control flow for bHaptics playback.
 
-- `src/haptics_controller.py`: publishes control messages
-- `src/haptics_relay.py`: subscribes to control messages and controls haptics playback
+- `src/bHpaticsMetronomeController.py`: publishes control messages
+- `src/bHapticsRelay.py`: subscribes to control messages and controls haptics playback
 
 At this stage, architecture is defined first and implementation follows.
 
@@ -28,13 +28,13 @@ Note: MQTT clients usually connect with `mqtt://`, `tcp://`, or `wss://` endpoin
     - Subscriber starts vibration at payload target time (with optional local `phase_shift_ms` compensation)
 
 ## 4) Component Responsibilities
-### A. Controller (`src/haptics_controller.py`)
+### A. Controller (`src/bHpaticsMetronomeController.py`)
 - Publish BPM to `/bhaptics/bpm`
 - Publish stop (`0`) or start timestamp (`unix_epoch_milliseconds`) to `/bhaptics/run`
 - For delayed start, compute target timestamp on publisher and publish immediately
 - Forward external control input (UI/CLI/test script) to MQTT
 
-### B. Relay (`src/haptics_relay.py`)
+### B. Relay (`src/bHapticsRelay.py`)
 - Subscribe to `/bhaptics/bpm` and `/bhaptics/run`
 - Keep latest BPM in memory
 - For start timestamp payload, schedule `_play_loop` at payload target time
@@ -72,11 +72,11 @@ Core invariants:
 - Define state resynchronization strategy after reconnect (later)
 
 ## 8) Planned Implementation Scope
-- `src/haptics_controller.py`
+- `src/bHpaticsMetronomeController.py`
   - MQTT client connect/reconnect
   - Helper functions to publish both topics
   - On delayed start command, publish computed target epoch-ms
-- `src/haptics_relay.py`
+- `src/bHapticsRelay.py`
   - Subscription callbacks for both topics
   - Timestamp-based start scheduling from payload target time
   - Reservation task cancellation/replacement on newer start timestamp

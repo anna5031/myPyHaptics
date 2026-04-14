@@ -21,6 +21,11 @@ except ModuleNotFoundError:
     tk = None
     messagebox = None
 
+try:
+    import winsound
+except ModuleNotFoundError:
+    winsound = None
+
 SUBSCRIBER_ID = 1
 TOPIC_BPM = "bhaptics/bpm"
 TOPIC_RUN = "bhaptics/run"
@@ -155,6 +160,14 @@ class CircleOneGui:
         self._thread.start()
         self._ready.wait(timeout=5.0)
 
+    def _play_tick_sound(self) -> None:
+        if winsound is None:
+            return
+        try:
+            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+        except Exception:
+            pass
+
     def _run(self) -> None:
         if tk is None:
             self._ready.set()
@@ -192,6 +205,7 @@ class CircleOneGui:
                     epoch_ms = self._queue.get_nowait()
                 except Empty:
                     break
+                self._play_tick_sound()
                 active_until_ms = max(active_until_ms, now_ms + 120)
                 canvas.itemconfigure(circle, fill="#00d18f", outline="#9fe8cf")
                 print(f"circle 1 shown at epoch_ms={epoch_ms} actual_ms={now_ms} delta_ms={now_ms - epoch_ms}")

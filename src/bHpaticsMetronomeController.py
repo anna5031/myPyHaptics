@@ -23,6 +23,7 @@ TOPIC_RUN = "bhaptics/run"
 
 ENV_FILE = ".env"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ICON_RELATIVE_PATH = Path("assets") / "bMet.ico"
 ENV_MQTT_BROKER = "MQTT_BROKER"
 ENV_MQTT_PORT = "MQTT_PORT"
 ENV_MQTT_KEEPALIVE = "MQTT_KEEPALIVE"
@@ -41,6 +42,22 @@ class BrokerConfig:
     retain: bool
     username: str | None
     password: str | None
+
+
+def _resolve_runtime_path(relative_path: Path) -> Path:
+    base_dir = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT))
+    return base_dir / relative_path
+
+
+def _apply_window_icon(root: tk.Tk) -> None:
+    icon_path = _resolve_runtime_path(ICON_RELATIVE_PATH)
+    if not icon_path.exists():
+        return
+    try:
+        root.iconbitmap(default=str(icon_path))
+    except Exception:
+        # Some Tk builds ignore iconbitmap on specific environments.
+        pass
 
 
 class PublishUI:
@@ -177,9 +194,29 @@ class PublishUI:
 
 def _load_dotenv(path: str = ENV_FILE) -> None:
     user_path = Path(path)
-    candidates = [user_path]
-    if not user_path.is_absolute():
-        candidates.append(PROJECT_ROOT / user_path)
+    candidates: list[Path] = []
+
+    if user_path.is_absolute():
+        candidates.append(user_path)
+    else:
+        # Resolve .env from common runtime roots.
+        # - local run: cwd, script dir, project root
+        # - PyInstaller run: cwd, exe dir, app root (parent of exe dir)
+        base_dirs: list[Path] = [Path.cwd()]
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).resolve().parent
+            base_dirs.extend([exe_dir, exe_dir.parent])
+        else:
+            script_dir = Path(__file__).resolve().parent
+            base_dirs.extend([script_dir, PROJECT_ROOT])
+
+        seen_base_dirs: set[Path] = set()
+        for base_dir in base_dirs:
+            resolved_base = base_dir.resolve()
+            if resolved_base in seen_base_dirs:
+                continue
+            seen_base_dirs.add(resolved_base)
+            candidates.append(base_dir / user_path)
 
     lines: list[str] | None = None
     seen_paths: set[Path] = set()
@@ -395,6 +432,7 @@ def main() -> int:
             if tk is None:
                 raise RuntimeError("tkinter is not available")
             root = tk.Tk()
+            _apply_window_icon(root)
             ui = PublishUI(root=root, client=None, config=config)
             ui._set_connection_status("connecting...")
             root.update_idletasks()

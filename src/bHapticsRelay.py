@@ -6,6 +6,7 @@ import contextlib
 import os
 import signal
 import sqlite3
+import sys
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -48,6 +49,7 @@ ENV_MQTT_USERNAME = "MQTT_USERNAME"
 ENV_MQTT_PASSWORD = "MQTT_PASSWORD"
 DEFAULT_APP_NAME = "Hello, bHaptics!"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ICON_RELATIVE_PATH = Path("assets") / "bMet.ico"
 MOTOR_LEN = 32
 DEFAULT_BPM = 120
 MIN_EPOCH_MS = 10**11
@@ -62,6 +64,27 @@ VIBRATION_INTENSITY_STEP = 5
 PHASE_SHIFT_MIN_MS = -2000
 PHASE_SHIFT_MAX_MS = 2000
 PHASE_SHIFT_STEP_MS = 5
+INITIALIZATION_RETRY_DELAY_SEC = 1.0
+INITIALIZATION_MAX_TRIALS = 5
+INITIALIZATION_FAILURE_STATUS = (
+    "connection failed. please open the \"bHaptics Player\" and restart this program."
+)
+
+
+def _resolve_runtime_path(relative_path: Path) -> Path:
+    base_dir = Path(getattr(sys, "_MEIPASS", PROJECT_ROOT))
+    return base_dir / relative_path
+
+
+def _apply_window_icon(root: tk.Tk) -> None:
+    icon_path = _resolve_runtime_path(ICON_RELATIVE_PATH)
+    if not icon_path.exists():
+        return
+    try:
+        root.iconbitmap(default=str(icon_path))
+    except Exception:
+        # Some Tk builds ignore iconbitmap on specific environments.
+        pass
 
 
 def _default_config_db_path() -> Path:
@@ -174,9 +197,29 @@ class ConfigStore:
 
 def _load_dotenv(path: str = ENV_FILE) -> None:
     user_path = Path(path)
-    candidates = [user_path]
-    if not user_path.is_absolute():
-        candidates.append(PROJECT_ROOT / user_path)
+    candidates: list[Path] = []
+
+    if user_path.is_absolute():
+        candidates.append(user_path)
+    else:
+        # Resolve .env from common runtime roots.
+        # - local run: cwd, script dir, project root
+        # - PyInstaller run: cwd, exe dir, app root (parent of exe dir)
+        base_dirs: list[Path] = [Path.cwd()]
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).resolve().parent
+            base_dirs.extend([exe_dir, exe_dir.parent])
+        else:
+            script_dir = Path(__file__).resolve().parent
+            base_dirs.extend([script_dir, PROJECT_ROOT])
+
+        seen_base_dirs: set[Path] = set()
+        for base_dir in base_dirs:
+            resolved_base = base_dir.resolve()
+            if resolved_base in seen_base_dirs:
+                continue
+            seen_base_dirs.add(resolved_base)
+            candidates.append(base_dir / user_path)
 
     lines: list[str] | None = None
     seen_paths: set[Path] = set()
@@ -320,6 +363,7 @@ class HapticsController:
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
 
         self._status_lock = threading.Lock()
+        self._stop_requested = threading.Event()
         self.current_bpm = DEFAULT_BPM
         self.current_run = 0
         self.current_run_state = "stopped"
@@ -339,11 +383,13 @@ class HapticsController:
         self.last_event = f"loaded phase_shift_ms={self.phase_shift_ms}"
 
         self.initialized = False
+        self.initialization_task: asyncio.Task[None] | None = None
         self.play_task: asyncio.Task[None] | None = None
         self.scheduled_start_task: asyncio.Task[None] | None = None
         self.current_schedule_id = 0
 
         self.thread.start()
+        self.loop.call_soon_threadsafe(self._ensure_initialization_task)
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
@@ -368,6 +414,11 @@ class HapticsController:
     def _set_player_status(self, status: str) -> None:
         with self._status_lock:
             self.player_status = status
+
+    def _ensure_initialization_task(self) -> None:
+        if self.initialization_task is not None and not self.initialization_task.done():
+            return
+        self.initialization_task = self.loop.create_task(self._initialize_forever())
 
     def _set_schedule_times(
         self,
@@ -412,22 +463,51 @@ class HapticsController:
         )
         self._set_last_event(f"committed phase_shift_ms={committed_phase}")
 
-    async def _initialize(self) -> None:
+    async def _initialize_forever(self) -> None:
         if self.initialized:
             return
-        self._set_player_status("connecting...")
-        try:
-            result = await bhaptics_python.registry_and_initialize(
-                self.app_id,
-                self.api_key,
-                self.app_name,
-            )
-        except Exception:
-            self._set_player_status("connection failed")
-            raise
-        print(f"bHaptics initialization result: {result}")
-        self.initialized = True
-        self._set_player_status("connected")
+
+        for trial in range(1, INITIALIZATION_MAX_TRIALS + 1):
+            if self._stop_requested.is_set():
+                return
+            self._set_player_status("connecting...")
+            try:
+                result = await bhaptics_python.registry_and_initialize(
+                    self.app_id,
+                    self.api_key,
+                    "",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(
+                    "warning: bHaptics initialization failed "
+                    f"(trial={trial}/{INITIALIZATION_MAX_TRIALS}): {exc}"
+                )
+                if trial < INITIALIZATION_MAX_TRIALS and not self._stop_requested.is_set():
+                    await asyncio.sleep(INITIALIZATION_RETRY_DELAY_SEC)
+                continue
+
+            print(f"bHaptics initialization result: {result}")
+            if result:
+                self.initialized = True
+                self._set_player_status("connected")
+                return
+
+            if trial < INITIALIZATION_MAX_TRIALS and not self._stop_requested.is_set():
+                await asyncio.sleep(INITIALIZATION_RETRY_DELAY_SEC)
+
+        if not self.initialized and not self._stop_requested.is_set():
+            self._set_player_status(INITIALIZATION_FAILURE_STATUS)
+
+    async def _cancel_initialization_task(self) -> None:
+        task = self.initialization_task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def _play_loop(self) -> None:
         next_tick = time.perf_counter()
@@ -497,7 +577,10 @@ class HapticsController:
         target_ms: int,
         schedule_id: int,
     ) -> None:
-        initialize_task = self.loop.create_task(self._initialize())
+        self._ensure_initialization_task()
+        initialize_task = self.initialization_task
+        if initialize_task is None:
+            raise RuntimeError("failed to create initialization task")
         try:
             now_ms = int(time.time() * 1000)
             delay_ms = target_ms - now_ms
@@ -653,10 +736,12 @@ class HapticsController:
         )
 
     async def _close_async(self) -> None:
+        self._stop_requested.set()
         self.current_run = 0
         self.current_schedule_id += 1
         self._set_run_state("stopped")
 
+        await self._cancel_initialization_task()
         await self._cancel_scheduled_start_task()
         await self._cancel_play_task()
         if self.initialized:
@@ -699,8 +784,7 @@ class HapticsController:
         future.result(timeout=timeout)
 
     def initialize(self, timeout: float = 5.0) -> None:
-        future = asyncio.run_coroutine_threadsafe(self._initialize(), self.loop)
-        future.result(timeout=timeout)
+        self.loop.call_soon_threadsafe(self._ensure_initialization_task)
 
     def get_status_snapshot(self) -> dict[str, int | str | None]:
         with self._status_lock:
@@ -736,7 +820,7 @@ class SubscriberControlUI:
 
     def __init__(
         self,
-        root: tk.Tk,
+        root: object,
         controller: HapticsController,
         request_stop,
     ) -> None:
@@ -1086,13 +1170,9 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _stop_handler)
 
     print("initializing bHaptics player")
-    try:
-        controller.initialize(timeout=5.0)
-    except Exception as exc:
-        print(f"warning: bHaptics initialization failed: {exc}")
-
     if not args.headless and tk is not None:
         root = tk.Tk()
+        _apply_window_icon(root)
         ui = SubscriberControlUI(root=root, controller=controller, request_stop=_request_stop)
         ui.set_mqtt_status("connecting...")
 

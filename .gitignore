@@ -3,3 +3,8 @@
 !.env.example
 __pycache__/
 *.pyc
+
+# Build artifacts
+build/
+dist/
+installer_output/

@@ -24,7 +24,7 @@ Note: MQTT clients usually connect with `mqtt://`, `tcp://`, or `wss://` endpoin
     - `0`: stop now
     - `<unix_epoch_milliseconds>`: absolute target start time from publisher
   - Rule:
-    - Publisher computes target time as `target_ms = floor(current_time_ms to second) + delay_s * 1000`
+    - Publisher computes target time as `target_ms = current_time_ms + delay_s * 1000`
     - Subscriber starts vibration at payload target time (with optional local `phase_shift_ms` compensation)
 
 ## 4) Component Responsibilities
@@ -43,7 +43,7 @@ Note: MQTT clients usually connect with `mqtt://`, `tcp://`, or `wss://` endpoin
 
 ## 5) Intended Runtime Sequence
 1. Controller sends BPM on `/bhaptics/bpm`
-2. Controller computes `target_ms = floor_to_second(now) + delay_s` and publishes it on `/bhaptics/run`
+2. Controller computes `target_ms = now_ms + delay_s * 1000` and publishes it on `/bhaptics/run`
 3. Relay receives target timestamp payload
 4. Relay waits until `target_ms`
 5. Relay starts `_play_loop` with latest BPM

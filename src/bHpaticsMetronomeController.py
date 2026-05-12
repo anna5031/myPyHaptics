@@ -398,8 +398,7 @@ def _resolve_run_payload(run: int, delay_sec: float | None = None) -> int:
     now_ms = int(time.time() * 1000)
     if delay_sec is None:
         return now_ms
-    base_ms = (now_ms // 1000) * 1000
-    return base_ms + int(delay_sec * 1000)
+    return now_ms + int(delay_sec * 1000)
 
 
 def main() -> int:

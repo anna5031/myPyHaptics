@@ -13,6 +13,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty, Queue
 from urllib.parse import urlparse
 
 import paho.mqtt.client as mqtt
@@ -387,6 +388,7 @@ class HapticsController:
         self.play_task: asyncio.Task[None] | None = None
         self.scheduled_start_task: asyncio.Task[None] | None = None
         self.current_schedule_id = 0
+        self.ui_flash_callback: callable | None = None
 
         self.thread.start()
         self.loop.call_soon_threadsafe(self._ensure_initialization_task)
@@ -529,6 +531,8 @@ class HapticsController:
             values = [intensity] * MOTOR_LEN
             prev_beat_before_ms = beat_before_ms
             beat_before_ms = int(time.time() * 1000)
+            if self.ui_flash_callback is not None:
+                self.ui_flash_callback(beat_before_ms)
             await bhaptics_python.play_dot(0, 100, values, -1)
             beat_after_ms = int(time.time() * 1000)
             play_dot_duration_ms = beat_after_ms - beat_before_ms
@@ -821,6 +825,9 @@ class HapticsController:
     def initialize(self, timeout: float = 5.0) -> None:
         self.loop.call_soon_threadsafe(self._ensure_initialization_task)
 
+    def set_ui_flash_callback(self, callback: callable) -> None:
+        self.ui_flash_callback = callback
+
     def get_status_snapshot(self) -> dict[str, int | str | None]:
         with self._status_lock:
             effective_phase_shift = self.phase_shift_ms + self.session_phase_shift_delta_ms
@@ -850,6 +857,47 @@ class HapticsController:
             self.loop.call_soon_threadsafe(self.loop.stop)
             self.thread.join(timeout=2.0)
 
+class SparklingDotGui:
+    def __init__(self, parent_frame: object) -> None:
+        self._queue: "Queue[int]" = Queue()
+        self._canvas = tk.Canvas(parent_frame, width=60, height=60, bg="#111111", highlightthickness=0)
+        self._canvas.pack(side=tk.LEFT, padx=(8, 0))
+        
+        self._circle = self._canvas.create_oval(10, 10, 50, 50, fill="#3a3a3a", outline="#777777", width=2)
+        self._active_until_ms = 0
+        self._running = True
+        
+        self._poll()
+    
+    def _reset_circle(self) -> None:
+        self._canvas.itemconfigure(self._circle, fill="#3a3a3a", outline="#777777")
+    
+    def _poll(self) -> None:
+        if not self._running:
+            return
+        
+        now_ms = int(time.time() * 1000)
+        while True:
+            try:
+                epoch_ms = self._queue.get_nowait()
+            except Empty:
+                break
+            self._active_until_ms = max(self._active_until_ms, now_ms + 120)
+            self._canvas.itemconfigure(self._circle, fill="#00d18f", outline="#9fe8cf")
+        
+        if self._active_until_ms and now_ms >= self._active_until_ms:
+            self._active_until_ms = 0
+            self._reset_circle()
+        
+        if self._running:
+            self._canvas.after(10, self._poll)
+    
+    def flash(self, epoch_ms: int) -> None:
+        self._queue.put(epoch_ms)
+    
+    def close(self) -> None:
+        self._running = False
+
 class SubscriberControlUI:
     REFRESH_MS = 200
 
@@ -862,6 +910,7 @@ class SubscriberControlUI:
         self.root = root
         self.controller = controller
         self.request_stop = request_stop
+        self.sparkling_gui: SparklingDotGui | None = None
 
         self.mqtt_status_var = tk.StringVar(value="connecting...")
         self.player_status_var = tk.StringVar(value="not initialized")
@@ -873,11 +922,12 @@ class SubscriberControlUI:
         self.apply_status_var = tk.StringVar(value="")
 
         self._build_layout()
+        self.controller.set_ui_flash_callback(self.flash_sparkling)
         self._refresh()
 
     def _build_layout(self) -> None:
         self.root.title("bHaptics Relay Controller")
-        self.root.geometry("640x320")
+        self.root.geometry("720x320")
         self.root.resizable(False, False)
 
         label_font = ("Helvetica", 12)
@@ -940,7 +990,7 @@ class SubscriberControlUI:
             text="<<",
             width=4,
             font=button_font,
-            command=lambda: self._step_phase_shift(-500),
+            command=lambda: self._step_phase_shift(-100),
         ).pack(side=tk.LEFT, padx=2)
 
         tk.Button(
@@ -972,7 +1022,7 @@ class SubscriberControlUI:
             text=">>",
             width=4,
             font=button_font,
-            command=lambda: self._step_phase_shift(500),
+            command=lambda: self._step_phase_shift(100),
         ).pack(side=tk.LEFT, padx=2)
 
         tk.Label(controls, text="Faster", font=value_font).pack(side=tk.LEFT, padx=(4, 8))
@@ -991,6 +1041,11 @@ class SubscriberControlUI:
         tk.Label(frame, textvariable=self.apply_status_var, fg="#1a5f7a", font=status_font).grid(
             row=7, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
+
+        sparkling_frame = tk.Frame(frame, bg="#111111")
+        sparkling_frame.grid(row=0, column=2, rowspan=2, padx=(12, 0))
+        if tk is not None:
+            self.sparkling_gui = SparklingDotGui(sparkling_frame)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1061,6 +1116,10 @@ class SubscriberControlUI:
 
     def set_mqtt_status(self, status: str) -> None:
         self.mqtt_status_var.set(status)
+
+    def flash_sparkling(self, epoch_ms: int) -> None:
+        if self.sparkling_gui is not None:
+            self.sparkling_gui.flash(epoch_ms)
 
     def _on_close(self) -> None:
         self.request_stop()

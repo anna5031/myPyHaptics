@@ -690,6 +690,24 @@ class HapticsController:
         if last_payload_target_ms is not None:
             await self._schedule_start_async(last_payload_target_ms)
 
+    async def _reset_phase_shift_async(self) -> None:
+        running = self.play_task is not None and not self.play_task.done()
+
+        if running:
+            with self._status_lock:
+                self.pending_phase_shift_ms = 0
+                self.session_phase_shift_delta_ms = 0
+            print("reset phase shift during running")
+            self._set_last_event("reset phase shift")
+        else:
+            with self._status_lock:
+                self.phase_shift_ms = 0
+                self.pending_phase_shift_ms = 0
+                self.session_phase_shift_delta_ms = 0
+            self.config_store.save_phase_shift_ms(0)
+            print("reset phase shift")
+            self._set_last_event("reset phase shift")
+
     async def _stop_async(self) -> None:
         self.current_run = 0
         self.current_schedule_id += 1
@@ -778,6 +796,13 @@ class HapticsController:
     def set_phase_shift(self, phase_shift_ms: int, timeout: float = 5.0) -> None:
         future = asyncio.run_coroutine_threadsafe(
             self._set_phase_shift_async(phase_shift_ms),
+            self.loop,
+        )
+        future.result(timeout=timeout)
+
+    def reset_phase_shift(self, timeout: float = 5.0) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            self._reset_phase_shift_async(),
             self.loop,
         )
         future.result(timeout=timeout)
@@ -908,28 +933,57 @@ class SubscriberControlUI:
         controls = tk.Frame(frame)
         controls.grid(row=5, column=1, sticky="w")
 
+        tk.Label(controls, text="Slower", font=value_font).pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(
+            controls,
+            text="<<",
+            width=4,
+            font=button_font,
+            command=lambda: self._step_phase_shift(-500),
+        ).pack(side=tk.LEFT, padx=2)
+
+        tk.Button(
+            controls,
+            text="<",
+            width=4,
+            font=button_font,
+            command=lambda: self._step_phase_shift(-PHASE_SHIFT_STEP_MS),
+        ).pack(side=tk.LEFT, padx=2)
+
         tk.Label(
             controls,
             textvariable=self.phase_shift_var,
             font=value_font,
             width=6,
             anchor="e",
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        ).pack(side=tk.LEFT, padx=8)
 
         tk.Button(
             controls,
-            text="Slower",
-            width=8,
-            font=button_font,
-            command=lambda: self._step_phase_shift(-PHASE_SHIFT_STEP_MS),
-        ).pack(side=tk.LEFT)
-        tk.Button(
-            controls,
-            text="Faster",
-            width=8,
+            text=">",
+            width=4,
             font=button_font,
             command=lambda: self._step_phase_shift(PHASE_SHIFT_STEP_MS),
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ).pack(side=tk.LEFT, padx=2)
+
+        tk.Button(
+            controls,
+            text=">>",
+            width=4,
+            font=button_font,
+            command=lambda: self._step_phase_shift(500),
+        ).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(controls, text="Faster", font=value_font).pack(side=tk.LEFT, padx=(4, 8))
+
+        tk.Button(
+            controls,
+            text="RESET",
+            width=6,
+            font=button_font,
+            command=self._reset_phase_shift,
+        ).pack(side=tk.LEFT, padx=2)
 
         tk.Label(frame, text="actual-target (ms)", font=label_font).grid(row=6, column=0, sticky="w")
         tk.Label(frame, textvariable=self.offset_var, font=value_font).grid(row=6, column=1, sticky="w")
@@ -977,6 +1031,15 @@ class SubscriberControlUI:
             self.apply_status_var.set(f"Failed to apply phase shift: {exc}")
             if messagebox is not None:
                 messagebox.showerror("Apply failed", str(exc))
+
+    def _reset_phase_shift(self) -> None:
+        try:
+            self.controller.reset_phase_shift()
+            self.apply_status_var.set("Reset phase_shift to 0")
+        except Exception as exc:
+            self.apply_status_var.set(f"Failed to reset phase shift: {exc}")
+            if messagebox is not None:
+                messagebox.showerror("Reset failed", str(exc))
 
     def _refresh(self) -> None:
         snapshot = self.controller.get_status_snapshot()

@@ -251,6 +251,8 @@ def _load_dotenv(path: str = ENV_FILE) -> None:
             continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
+        if not value:
+            continue
         os.environ[key] = value
 
 

@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\bHapticsRelay.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets\\bMet.ico', 'assets')],
+    datas=[('assets\\bMet.ico', 'assets'), ('.env', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
